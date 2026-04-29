@@ -1,0 +1,10 @@
+build/
+deps/
+results/
+figures/
+__pycache__/
+*.pyc
+*.json
+.venv/
+.vscode/
+.DS_Store
