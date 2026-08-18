@@ -29,6 +29,8 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import matplotlib.colors as mcolors
 
+from validate_gdlll_results import validate_main_results
+
 # ── Paths ────────────────────────────────────────────────────────────────────
 BASE = os.path.join(os.path.dirname(__file__), "..")
 RESULT_DIR = os.path.join(BASE, "results")
@@ -97,12 +99,18 @@ def save_fig(fig, name):
 # ── Load data ─────────────────────────────────────────────────────────────────
 def load_gdlll():
     path = os.path.join(RESULT_DIR, "gdlll_final.json")
-    if not os.path.isfile(path):
+    final = os.path.isfile(path)
+    if not final:
         path = os.path.join(RESULT_DIR, "gdlll.json")
     if not os.path.isfile(path):
         print("ERROR: no gdlll*.json found.", file=sys.stderr)
         sys.exit(1)
-    raw = open(path).read()
+    with open(path, encoding="utf-8") as handle:
+        raw = handle.read()
+    if final:
+        data = json.loads(raw)
+        validate_main_results(data)
+        return data
     # Fix known issues: double commas, nan/inf literals
     raw = re.sub(r",\s*,", ",", raw)
     raw = re.sub(r":-?nan\b", ":null", raw)
@@ -362,9 +370,9 @@ def plot_time(data):
 FAM_SHORT = {"gaussian": "gaussian", "qary": "qary", "goldstein-mayer": "goldstein"}
 
 
-# ── Per-family 4-panel benchmarks (deep_benchmark_*.pdf) ─────────────────────
+# ── Per-family five-panel benchmarks (deep_benchmark_*.pdf) ──────────────────
 def plot_per_family(data, family):
-    """5-panel figure: (a) ops, (b) equiv-swaps W, (c) time, (d) δ₀, (e) variance."""
+    """Five panels: operations, equivalent swaps, time, quality, and variance."""
     tag = FAM_SHORT.get(family, family)
     results = data.get("results", data)
     if family not in results:
@@ -486,8 +494,8 @@ def plot_per_family(data, family):
         ax_var,
         "final_var",
         ALGS,
-        r"Final $\sum p_i^2$",
-        r"(e) Fixed-point variance ($\pm 1$\,SE)",
+        r"Final profile variance",
+        r"(e) Final profile variance ($\pm 1$\,SE)",
     )
 
     save_fig(fig, f"deep_benchmark_{tag}.pdf")
@@ -498,7 +506,7 @@ if __name__ == "__main__":
     print("Generating G-DLLL figures …")
     data = load_gdlll()
 
-    # Per-family 4-panel benchmarks (deep_benchmark_*.pdf)
+    # Per-family five-panel benchmarks (deep_benchmark_*.pdf)
     for family in FAMILIES:
         plot_per_family(data, family)
 

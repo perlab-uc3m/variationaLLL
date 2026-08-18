@@ -56,21 +56,21 @@
  *   O(10d)-bit entries fplll's babai handles the multi-pass innerloop
  *   transparently through the GSO_INT_GRAM exact-Gram arithmetic path.
  *
- * Thread safety:
- *   FP_NR<mpfr_t>::set_prec() sets the global MPFR default precision.
- *   Within one benchmark block all threads process bases of the same
- *   dimension (identical entry bit-width), so every thread calls
- *   set_prec with the same argument — a benign concurrent write.
+ * MPFR precision is selected in each benchmark thread before the GSO
+ * objects are constructed.
  */
 #ifndef DEEP_LLL_H
 #define DEEP_LLL_H
 
 #include <fplll/fplll.h>
+#include <cfloat>
 #include <cstdio>
 #include <cstdlib>
 #include <cmath>
 #include <cstring>
 #include <ctime>
+#include <limits>
+#include <vector>
 
 using namespace fplll;
 
@@ -79,11 +79,14 @@ using namespace fplll;
 /* ================================================================== */
 
 typedef struct {
-    int    n_ops;         /* swap / insertion count                   */
-    int    n_equiv_swaps; /* cumulative depth (Σ(k-j) for deep)       */
-    double delta0;        /* root Hermite factor                      */
-    double final_var;     /* log-norm profile variance                */
-    double elapsed_sec;   /* wall-clock time                          */
+    int    n_ops;            /* swap / insertion count              */
+    int    n_equiv_swaps;    /* cumulative depth for deep moves     */
+    int    n_fallback_swaps; /* zero-score adjacent LLL swaps        */
+    int    hit_op_limit;     /* one if the implementation cap fired */
+    int    lll_reduced;      /* one if the final basis passes fplll  */
+    double delta0;           /* root Hermite factor                 */
+    double final_var;        /* log-norm profile variance           */
+    double elapsed_sec;      /* wall-clock time                     */
 } deep_result_t;
 
 typedef struct {
@@ -138,6 +141,40 @@ static void read_gso(MatGSOInterface<Z_NR<mpz_t>, FT> &M, int d, double *mu,
     }
 }
 
+template <class FT>
+static void read_log_diagonal(MatGSOInterface<Z_NR<mpz_t>, FT> &M, int d,
+                              double *log_r) {
+    FT value, log_value;
+    for (int i = 0; i < d; i++) {
+        M.get_r(value, i, i);
+        log_value.log(value);
+        log_r[i] = log_value.get_d();
+    }
+}
+
+template <class FT> static long double fp_to_long_double(FT &value) {
+    return (long double)value.get_d();
+}
+
+static long double fp_to_long_double(FP_NR<mpfr_t> &value) {
+    return mpfr_get_ld(value.get_data(), MPFR_RNDN);
+}
+
+template <class FT>
+static void read_gso_wide(MatGSOInterface<Z_NR<mpz_t>, FT> &M, int d, long double *mu,
+                          long double *r) {
+    FT value;
+    memset(mu, 0, (size_t)d * d * sizeof(long double));
+    for (int i = 0; i < d; i++) {
+        M.get_r(value, i, i);
+        r[i] = fp_to_long_double(value);
+        for (int j = 0; j < i; j++) {
+            M.get_mu(value, i, j);
+            mu[i * d + j] = fp_to_long_double(value);
+        }
+    }
+}
+
 /*
  * One-shot GSO computation: build a temporary MatGSO, compute full GSO,
  * fill mu[0..d*d-1] and r[0..d-1].  Precision-dispatches automatically.
@@ -186,6 +223,29 @@ static double compute_delta0(const ZZ_mat<mpz_t> &B, int d, int m, const double 
     return exp((log_b0 - log_vol / d) / d);
 }
 
+static double compute_delta0(const ZZ_mat<mpz_t> &B, int d, int m,
+                             const long double *r) {
+    mpz_t b0sq, tmp;
+    mpz_init(b0sq);
+    mpz_init(tmp);
+    for (int c = 0; c < m; c++) {
+        B[0][c].get_mpz(tmp);
+        mpz_addmul(b0sq, tmp, tmp);
+    }
+    mpfr_t fb;
+    mpfr_init2(fb, 128);
+    mpfr_set_z(fb, b0sq, MPFR_RNDN);
+    mpfr_log(fb, fb, MPFR_RNDN);
+    long double log_b0 = 0.5L * mpfr_get_ld(fb, MPFR_RNDN);
+    mpfr_clear(fb);
+    mpz_clear(tmp);
+    mpz_clear(b0sq);
+
+    long double log_vol = 0.0L;
+    for (int i = 0; i < d; i++) log_vol += 0.5L * logl(fmaxl(r[i], LDBL_MIN));
+    return (double)expl((log_b0 - log_vol / d) / d);
+}
+
 static double profile_variance(const double *r, int d) {
     double mean = 0.0;
     for (int i = 0; i < d; i++) mean += 0.5 * log(fmax(r[i], 1e-30));
@@ -196,6 +256,18 @@ static double profile_variance(const double *r, int d) {
         var += p * p;
     }
     return var / d;
+}
+
+static double profile_variance(const long double *r, int d) {
+    long double mean = 0.0L;
+    for (int i = 0; i < d; i++) mean += 0.5L * logl(fmaxl(r[i], LDBL_MIN));
+    mean /= d;
+    long double var = 0.0L;
+    for (int i = 0; i < d; i++) {
+        long double p = 0.5L * logl(fmaxl(r[i], LDBL_MIN)) - mean;
+        var += p * p;
+    }
+    return (double)(var / d);
 }
 
 /* ================================================================== */
@@ -357,6 +429,67 @@ static void cascade_r_new(const double *mu, const double *r, int d, int k, int j
     }
 }
 
+static inline double positive_norm(double x) {
+    return fmax(x, std::numeric_limits<double>::min());
+}
+
+static inline double variance_term(double r) {
+    double p = 0.5 * log(positive_norm(r));
+    return p * p;
+}
+
+/* Extend the score from insertion point j+1 to j.  Only the two new
+ * positions differ, so the update is constant-time. */
+static inline double extend_variance_drop(double drop, double rj, double P_next,
+                                          double P_cur) {
+    double shifted = rj * (P_next / positive_norm(P_cur));
+    double old_gap = 0.5 * (log(positive_norm(rj)) - log(positive_norm(P_next)));
+    double new_gap = 0.5 * (log(positive_norm(P_cur)) - log(positive_norm(shifted)));
+    return drop + 0.5 * (old_gap * old_gap - new_gap * new_gap);
+}
+
+static inline double power_term(double r, double alpha) {
+    return pow(positive_norm(r), alpha);
+}
+
+static inline double extend_power_drop(double drop, double rj, double P_next,
+                                       double P_cur, double alpha) {
+    double shifted = rj * (P_next / positive_norm(P_cur));
+    return drop + power_term(rj, alpha) + power_term(P_next, alpha) -
+           power_term(P_cur, alpha) - power_term(shifted, alpha);
+}
+
+static inline long double positive_norm(long double x) {
+    return fmaxl(x, LDBL_MIN);
+}
+
+static inline long double variance_term(long double r) {
+    long double p = 0.5L * logl(positive_norm(r));
+    return p * p;
+}
+
+static inline long double extend_variance_drop(long double drop, long double rj,
+                                               long double P_next, long double P_cur) {
+    long double shifted = rj * (P_next / positive_norm(P_cur));
+    long double old_gap =
+        0.5L * (logl(positive_norm(rj)) - logl(positive_norm(P_next)));
+    long double new_gap =
+        0.5L * (logl(positive_norm(P_cur)) - logl(positive_norm(shifted)));
+    return drop + 0.5L * (old_gap * old_gap - new_gap * new_gap);
+}
+
+static inline long double power_term(long double r, double alpha) {
+    return powl(positive_norm(r), (long double)alpha);
+}
+
+static inline long double extend_power_drop(long double drop, long double rj,
+                                            long double P_next, long double P_cur,
+                                            double alpha) {
+    long double shifted = rj * (P_next / positive_norm(P_cur));
+    return drop + power_term(rj, alpha) + power_term(P_next, alpha) -
+           power_term(P_cur, alpha) - power_term(shifted, alpha);
+}
+
 /* Deep-Var: Δ(Σp²) over the span [j..k]. */
 static double score_deep_var(const double *mu, const double *r, int d, int k, int j,
                              double *wr, double *wP) {
@@ -416,8 +549,8 @@ static deep_result_t run_lll_standard_impl(ZZ_mat<mpz_t> &B, int d, int m, doubl
     struct timespec t0, t1;
     clock_gettime(CLOCK_MONOTONIC, &t0);
 
-    double *mu = (double *)calloc((size_t)d * d, sizeof(double));
-    double *r  = (double *)calloc((size_t)d, sizeof(double));
+    long double *mu = (long double *)calloc((size_t)d * d, sizeof(long double));
+    long double *r  = (long double *)calloc((size_t)d, sizeof(long double));
 
     ZZ_mat<mpz_t>                 eu, eut;
     MatGSO<Z_NR<mpz_t>, FT>       M(B, eu, eut, gso_flags);
@@ -431,9 +564,10 @@ static deep_result_t run_lll_standard_impl(ZZ_mat<mpz_t> &B, int d, int m, doubl
 
     /* Ensure full GSO validity for final metric read. */
     M.update_gso();
-    read_gso(M, d, mu, r);
-    res.delta0    = compute_delta0(B, d, m, r);
-    res.final_var = profile_variance(r, d);
+    read_gso_wide(M, d, mu, r);
+    res.lll_reduced = is_lll_reduced(M, delta, LLL_DEF_ETA);
+    res.delta0      = compute_delta0(B, d, m, r);
+    res.final_var   = profile_variance(r, d);
     clock_gettime(CLOCK_MONOTONIC, &t1);
     res.elapsed_sec = (t1.tv_sec - t0.tv_sec) + (t1.tv_nsec - t0.tv_nsec) * 1e-9;
     free(mu);
@@ -747,41 +881,45 @@ static deep_result_t run_deep_var_impl(ZZ_mat<mpz_t> &B, int d, int m, double de
     struct timespec t0, t1;
     clock_gettime(CLOCK_MONOTONIC, &t0);
 
-    int     max_ops = 500000;
-    double *mu      = (double *)calloc((size_t)d * d, sizeof(double));
-    double *r       = (double *)calloc((size_t)d, sizeof(double));
-    double *wr      = (double *)calloc((size_t)d, sizeof(double));
-    double *wP      = (double *)calloc((size_t)d, sizeof(double));
-
-    ZZ_mat<mpz_t>                 eu, eut;
+    int           max_ops = 500000;
+    long double  *mu      = (long double *)calloc((size_t)d * d, sizeof(long double));
+    long double  *r       = (long double *)calloc((size_t)d, sizeof(long double));
+    ZZ_mat<mpz_t> eu, eut;
     MatGSO<Z_NR<mpz_t>, FT>       M(B, eu, eut, gso_flags);
     LLLReduction<Z_NR<mpz_t>, FT> L(M, delta, LLL_DEF_ETA, LLL_DEFAULT);
-
-    if (gso_flags == GSO_INT_GRAM) L.lll(0, 0, d);
 
     int sr_from = 0;
     while (res.n_ops < max_ops) {
         L.size_reduction(sr_from, d);
-        read_gso(M, d, mu, r);
+        read_gso_wide(M, d, mu, r);
 
-        int    best_k = -1, best_j = -1;
-        double best = 0.0;
+        int         best_k = -1, best_j = -1;
+        int         fallback_k = -1;
+        long double best       = 0.0L;
         for (int k = 1; k < d; k++) {
-            double Pc = r[k];
+            long double P_next = r[k];
+            long double drop   = 0.0L;
             for (int j = k - 1; j >= 0; j--) {
-                double mkj = mu[k * d + j];
-                Pc += mkj * mkj * r[j];
+                long double mkj = mu[k * d + j];
+                long double Pc  = P_next + mkj * mkj * r[j];
+                drop            = extend_variance_drop(drop, r[j], P_next, Pc);
                 if (Pc < delta * r[j]) {
-                    double sc = score_deep_var(mu, r, d, k, j, wr, wP);
-                    if (sc > best) {
-                        best   = sc;
+                    if (j == k - 1 && fallback_k < 0) fallback_k = k;
+                    if (drop > best) {
+                        best   = drop;
                         best_k = k;
                         best_j = j;
                     }
                 }
+                P_next = Pc;
             }
         }
-        if (best_k < 0) break;
+        if (best_k < 0) {
+            if (fallback_k < 0) break;
+            best_k = fallback_k;
+            best_j = fallback_k - 1;
+            res.n_fallback_swaps++;
+        }
 
         /* move_row(old, new): move row best_k to position best_j.    */
         M.move_row(best_k, best_j);
@@ -789,17 +927,17 @@ static deep_result_t run_deep_var_impl(ZZ_mat<mpz_t> &B, int d, int m, double de
         res.n_equiv_swaps += best_k - best_j;
         sr_from = best_j;
     }
+    if (res.n_ops >= max_ops) res.hit_op_limit = 1;
 
     L.size_reduction(0, d);
-    read_gso(M, d, mu, r);
-    res.delta0    = compute_delta0(B, d, m, r);
-    res.final_var = profile_variance(r, d);
+    read_gso_wide(M, d, mu, r);
+    res.lll_reduced = is_lll_reduced(M, delta, LLL_DEF_ETA);
+    res.delta0      = compute_delta0(B, d, m, r);
+    res.final_var   = profile_variance(r, d);
     clock_gettime(CLOCK_MONOTONIC, &t1);
     res.elapsed_sec = (t1.tv_sec - t0.tv_sec) + (t1.tv_nsec - t0.tv_nsec) * 1e-9;
     free(mu);
     free(r);
-    free(wr);
-    free(wP);
     return res;
 }
 
@@ -832,33 +970,33 @@ static deep_result_t run_deep_ssgg_impl(ZZ_mat<mpz_t> &B, int d, int m, double d
     struct timespec t0, t1;
     clock_gettime(CLOCK_MONOTONIC, &t0);
 
-    int     max_ops = 500000;
-    double *mu      = (double *)calloc((size_t)d * d, sizeof(double));
-    double *r       = (double *)calloc((size_t)d, sizeof(double));
+    int          max_ops = 500000;
+    long double *mu      = (long double *)calloc((size_t)d * d, sizeof(long double));
+    long double *r       = (long double *)calloc((size_t)d, sizeof(long double));
 
     ZZ_mat<mpz_t>                 eu, eut;
     MatGSO<Z_NR<mpz_t>, FT>       M(B, eu, eut, gso_flags);
     LLLReduction<Z_NR<mpz_t>, FT> L(M, delta, LLL_DEF_ETA, LLL_DEFAULT);
 
-    if (gso_flags == GSO_INT_GRAM) L.lll(0, 0, d);
-
     int sr_from = 0;
     while (res.n_ops < max_ops) {
         L.size_reduction(sr_from, d);
-        read_gso(M, d, mu, r);
+        read_gso_wide(M, d, mu, r);
 
-        int    best_k = -1, best_j = -1;
-        double best = 0.0;
+        int         best_k = -1, best_j = -1;
+        int         fallback_k = -1;
+        long double best       = 0.0L;
         for (int k = 1; k < d; k++) {
-            double Pc = r[k];
-            double S  = 0.0;
+            long double Pc = r[k];
+            long double S  = 0.0L;
             for (int j = k - 1; j >= 0; j--) {
-                double mkj  = mu[k * d + j];
-                double term = mkj * mkj * r[j];
+                long double mkj  = mu[k * d + j];
+                long double term = mkj * mkj * r[j];
                 Pc += term;
                 /* Pc now equals D_j; add the j-th ΔSS contribution. */
-                S += term * (r[j] / fmax(Pc, 1e-30) - 1.0);
+                S += term * (r[j] / positive_norm(Pc) - 1.0L);
                 if (Pc < delta * r[j]) {
+                    if (j == k - 1 && fallback_k < 0) fallback_k = k;
                     if (S > best) {
                         best   = S;
                         best_k = k;
@@ -867,18 +1005,25 @@ static deep_result_t run_deep_ssgg_impl(ZZ_mat<mpz_t> &B, int d, int m, double d
                 }
             }
         }
-        if (best_k < 0) break;
+        if (best_k < 0) {
+            if (fallback_k < 0) break;
+            best_k = fallback_k;
+            best_j = fallback_k - 1;
+            res.n_fallback_swaps++;
+        }
 
         M.move_row(best_k, best_j);
         res.n_ops++;
         res.n_equiv_swaps += best_k - best_j;
         sr_from = best_j;
     }
+    if (res.n_ops >= max_ops) res.hit_op_limit = 1;
 
     L.size_reduction(0, d);
-    read_gso(M, d, mu, r);
-    res.delta0    = compute_delta0(B, d, m, r);
-    res.final_var = profile_variance(r, d);
+    read_gso_wide(M, d, mu, r);
+    res.lll_reduced = is_lll_reduced(M, delta, LLL_DEF_ETA);
+    res.delta0      = compute_delta0(B, d, m, r);
+    res.final_var   = profile_variance(r, d);
     clock_gettime(CLOCK_MONOTONIC, &t1);
     res.elapsed_sec = (t1.tv_sec - t0.tv_sec) + (t1.tv_nsec - t0.tv_nsec) * 1e-9;
     free(mu);
@@ -986,10 +1131,12 @@ static deep_result_t run_deep_schurK_impl(ZZ_mat<mpz_t> &B, int d, int m, double
         sr_from = best_j;
     }
 
+    if (res.n_ops >= max_ops) res.hit_op_limit = 1;
     L.size_reduction(0, d);
     read_gso(M, d, mu, r);
-    res.delta0    = compute_delta0(B, d, m, r);
-    res.final_var = profile_variance(r, d);
+    res.lll_reduced = is_lll_reduced(M, delta, LLL_DEF_ETA);
+    res.delta0      = compute_delta0(B, d, m, r);
+    res.final_var   = profile_variance(r, d);
     clock_gettime(CLOCK_MONOTONIC, &t1);
     res.elapsed_sec = (t1.tv_sec - t0.tv_sec) + (t1.tv_nsec - t0.tv_nsec) * 1e-9;
     free(mu);
@@ -1012,45 +1159,34 @@ static deep_result_t run_deep_schurK(ZZ_mat<mpz_t> &B, int d, int m, double delt
 
 /* ================================================================== */
 /*  Init-Adaptive                                                      */
-/*  α = A·(1+CV₀)^{-γ} fixed from initial profile CV.               */
+/*  alpha = (2/(1+CV_0))^gamma, fixed from the initial profile.      */
 /* ================================================================== */
 
 template <class FT>
 static deep_result_t run_deep_inita_impl(ZZ_mat<mpz_t> &B, int d, int m, double delta,
-                                         int gso_flags, double A, double gamma_p) {
+                                         int gso_flags, double gamma_p) {
     deep_result_t res;
     memset(&res, 0, sizeof(res));
     struct timespec t0, t1;
     clock_gettime(CLOCK_MONOTONIC, &t0);
 
-    int     max_ops     = 500000;
-    double  alpha_floor = 0.4;
-    double  alpha       = 1.0;
-    double *mu          = (double *)calloc((size_t)d * d, sizeof(double));
-    double *r           = (double *)calloc((size_t)d, sizeof(double));
-    double *wr          = (double *)calloc((size_t)d, sizeof(double));
-    double *wP          = (double *)calloc((size_t)d, sizeof(double));
+    int          max_ops     = 500000;
+    double       alpha_floor = 0.4;
+    double       alpha       = 1.0;
+    long double *mu = (long double *)calloc((size_t)d * d, sizeof(long double));
+    long double *r  = (long double *)calloc((size_t)d, sizeof(long double));
 
     ZZ_mat<mpz_t>                 eu, eut;
     MatGSO<Z_NR<mpz_t>, FT>       M(B, eu, eut, gso_flags);
     LLLReduction<Z_NR<mpz_t>, FT> L(M, delta, LLL_DEF_ETA, LLL_DEFAULT);
 
-    /* Compute α from the RAW GSO profile (before initial LLL),
-       so that the calibration captures the lattice's intrinsic structure
-       (e.g. bimodal q-ary profiles give CV₀ ≈ 1 → α ≈ 1).
-       We use a lightweight double-precision GSO for calibration to avoid
-       the cost of an extra M.update_gso() in mpfr precision. */
+    /* Compute alpha from the raw GSO profile.  Use the selected GSO
+       precision here as well, because a double GSO can overflow on a
+       raw Goldstein-Mayer basis. */
     {
-        ZZ_mat<mpz_t>                      eu_cal, eut_cal;
-        MatGSO<Z_NR<mpz_t>, FP_NR<double>> Mcal(B, eu_cal, eut_cal, GSO_DEFAULT);
-        Mcal.update_gso();
-
         std::vector<double> log_r_raw(d);
-        for (int i = 0; i < d; i++) {
-            FP_NR<double> tmp;
-            Mcal.get_r(tmp, i, i);
-            log_r_raw[i] = log(fmax(tmp.get_d(), 1e-300));
-        }
+        M.update_gso();
+        read_log_diagonal(M, d, log_r_raw.data());
         double mean_logr_raw = 0.0;
         for (int i = 0; i < d; i++) mean_logr_raw += log_r_raw[i];
         mean_logr_raw /= d;
@@ -1061,80 +1197,70 @@ static deep_result_t run_deep_inita_impl(ZZ_mat<mpz_t> &B, int d, int m, double 
         }
         var_logr_raw /= d;
         double cv0 = sqrt(var_logr_raw) / fmax(fabs(mean_logr_raw), 1e-10);
-        alpha      = fmax(alpha_floor, A * pow(1.0 + cv0, -gamma_p));
+        alpha      = fmax(alpha_floor, pow(2.0 / (1.0 + cv0), gamma_p));
     }
-
-    if (gso_flags == GSO_INT_GRAM) L.lll(0, 0, d);
-
-    /* Precompute whether alpha is close enough to 1 to skip pow(). */
-    const bool alpha_is_one = (fabs(alpha - 1.0) < 1e-12);
 
     int sr_from = 0;
     while (res.n_ops < max_ops) {
         L.size_reduction(sr_from, d);
-        read_gso(M, d, mu, r);
+        read_gso_wide(M, d, mu, r);
 
-        int    best_k = -1, best_j = -1;
-        double best = 0.0;
+        int         best_k = -1, best_j = -1;
+        int         fallback_k = -1;
+        long double best       = 0.0L;
         for (int k = 1; k < d; k++) {
-            double Pc = r[k];
+            long double P_next = r[k];
+            long double drop   = 0.0L;
             for (int j = k - 1; j >= 0; j--) {
-                double mkj = mu[k * d + j];
-                Pc += mkj * mkj * r[j];
+                long double mkj = mu[k * d + j];
+                long double Pc  = P_next + mkj * mkj * r[j];
+                drop            = extend_power_drop(drop, r[j], P_next, Pc, alpha);
                 if (Pc < delta * r[j]) {
-                    int span = k - j + 1;
-                    cascade_r_new(mu, r, d, k, j, wr, wP);
-                    double old_s = 0.0, new_s = 0.0;
-                    if (alpha_is_one) {
-                        for (int idx = 0; idx < span; idx++) {
-                            old_s += r[j + idx];
-                            new_s += wr[idx];
-                        }
-                    } else {
-                        for (int idx = 0; idx < span; idx++) {
-                            old_s += pow(fmax(r[j + idx], 1e-30), alpha);
-                            new_s += pow(fmax(wr[idx], 1e-30), alpha);
-                        }
-                    }
-                    double sc = old_s - new_s;
-                    if (sc > best) {
-                        best   = sc;
+                    if (j == k - 1 && fallback_k < 0) fallback_k = k;
+                    if (drop > best) {
+                        best   = drop;
                         best_k = k;
                         best_j = j;
                     }
                 }
+                P_next = Pc;
             }
         }
-        if (best_k < 0) break;
+        if (best_k < 0) {
+            if (fallback_k < 0) break;
+            best_k = fallback_k;
+            best_j = fallback_k - 1;
+            res.n_fallback_swaps++;
+        }
 
         M.move_row(best_k, best_j);
         res.n_ops++;
         res.n_equiv_swaps += best_k - best_j;
         sr_from = best_j;
     }
+    if (res.n_ops >= max_ops) res.hit_op_limit = 1;
 
     L.size_reduction(0, d);
-    read_gso(M, d, mu, r);
-    res.delta0    = compute_delta0(B, d, m, r);
-    res.final_var = profile_variance(r, d);
+    read_gso_wide(M, d, mu, r);
+    res.lll_reduced = is_lll_reduced(M, delta, LLL_DEF_ETA);
+    res.delta0      = compute_delta0(B, d, m, r);
+    res.final_var   = profile_variance(r, d);
     clock_gettime(CLOCK_MONOTONIC, &t1);
     res.elapsed_sec = (t1.tv_sec - t0.tv_sec) + (t1.tv_nsec - t0.tv_nsec) * 1e-9;
     free(mu);
     free(r);
-    free(wr);
-    free(wP);
     return res;
 }
 
 static deep_result_t run_deep_inita(ZZ_mat<mpz_t> &B, int d, int m, double delta,
-                                    double A, double gamma_p) {
+                                    double gamma_p) {
     int mb = compute_max_bits(B, d, m);
     if (mb > 26) {
         FP_NR<mpfr_t>::set_prec(2 * mb + 64);
-        return run_deep_inita_impl<FP_NR<mpfr_t>>(B, d, m, delta, GSO_INT_GRAM, A,
+        return run_deep_inita_impl<FP_NR<mpfr_t>>(B, d, m, delta, GSO_INT_GRAM,
                                                   gamma_p);
     }
-    return run_deep_inita_impl<FP_NR<double>>(B, d, m, delta, GSO_DEFAULT, A, gamma_p);
+    return run_deep_inita_impl<FP_NR<double>>(B, d, m, delta, GSO_DEFAULT, gamma_p);
 }
 
 /* ================================================================== */
@@ -1422,11 +1548,9 @@ static deep_alpha_result_t run_deep_fixed_alpha_impl(ZZ_mat<mpz_t> &B, int d, in
     struct timespec t0, t1;
     clock_gettime(CLOCK_MONOTONIC, &t0);
 
-    int     max_ops = 500000;
-    double *mu      = (double *)calloc((size_t)d * d, sizeof(double));
-    double *r       = (double *)calloc((size_t)d, sizeof(double));
-    double *wr      = (double *)calloc((size_t)d, sizeof(double));
-    double *wP      = (double *)calloc((size_t)d, sizeof(double));
+    int          max_ops = 500000;
+    long double *mu      = (long double *)calloc((size_t)d * d, sizeof(long double));
+    long double *r       = (long double *)calloc((size_t)d, sizeof(long double));
 
     ZZ_mat<mpz_t>                 eu, eut;
     MatGSO<Z_NR<mpz_t>, FT>       M(B, eu, eut, gso_flags);
@@ -1434,74 +1558,67 @@ static deep_alpha_result_t run_deep_fixed_alpha_impl(ZZ_mat<mpz_t> &B, int d, in
 
     /* Compute CV₀ for reporting. */
     L.size_reduction(0, d);
-    read_gso(M, d, mu, r);
-    double mean_logr = 0.0;
-    for (int i = 0; i < d; i++) mean_logr += log(fmax(r[i], 1e-30));
+    read_gso_wide(M, d, mu, r);
+    long double mean_logr = 0.0L;
+    for (int i = 0; i < d; i++) mean_logr += logl(positive_norm(r[i]));
     mean_logr /= d;
-    double var_logr = 0.0;
+    long double var_logr = 0.0L;
     for (int i = 0; i < d; i++) {
-        double diff = log(fmax(r[i], 1e-30)) - mean_logr;
+        long double diff = logl(positive_norm(r[i])) - mean_logr;
         var_logr += diff * diff;
     }
     var_logr /= d;
-    out.cv0 = sqrt(var_logr) / fmax(fabs(mean_logr), 1e-10);
-
-    const bool alpha_is_one = (fabs(alpha - 1.0) < 1e-12);
+    out.cv0 = (double)(sqrtl(var_logr) / fmaxl(fabsl(mean_logr), 1e-10L));
 
     int sr_from = 0;
     while (res.n_ops < max_ops) {
         L.size_reduction(sr_from, d);
-        read_gso(M, d, mu, r);
+        read_gso_wide(M, d, mu, r);
 
-        int    best_k = -1, best_j = -1;
-        double best = 0.0;
+        int         best_k = -1, best_j = -1;
+        int         fallback_k = -1;
+        long double best       = 0.0L;
         for (int k = 1; k < d; k++) {
-            double Pc = r[k];
+            long double P_next = r[k];
+            long double drop   = 0.0L;
             for (int j = k - 1; j >= 0; j--) {
-                double mkj = mu[k * d + j];
-                Pc += mkj * mkj * r[j];
+                long double mkj = mu[k * d + j];
+                long double Pc  = P_next + mkj * mkj * r[j];
+                drop            = extend_power_drop(drop, r[j], P_next, Pc, alpha);
                 if (Pc < delta * r[j]) {
-                    int span = k - j + 1;
-                    cascade_r_new(mu, r, d, k, j, wr, wP);
-                    double old_s = 0.0, new_s = 0.0;
-                    if (alpha_is_one) {
-                        for (int idx = 0; idx < span; idx++) {
-                            old_s += r[j + idx];
-                            new_s += wr[idx];
-                        }
-                    } else {
-                        for (int idx = 0; idx < span; idx++) {
-                            old_s += pow(fmax(r[j + idx], 1e-30), alpha);
-                            new_s += pow(fmax(wr[idx], 1e-30), alpha);
-                        }
-                    }
-                    double sc = old_s - new_s;
-                    if (sc > best) {
-                        best   = sc;
+                    if (j == k - 1 && fallback_k < 0) fallback_k = k;
+                    if (drop > best) {
+                        best   = drop;
                         best_k = k;
                         best_j = j;
                     }
                 }
+                P_next = Pc;
             }
         }
-        if (best_k < 0) break;
+        if (best_k < 0) {
+            if (fallback_k < 0) break;
+            best_k = fallback_k;
+            best_j = fallback_k - 1;
+            res.n_fallback_swaps++;
+        }
 
         M.move_row(best_k, best_j);
         res.n_ops++;
         res.n_equiv_swaps += best_k - best_j;
         sr_from = best_j;
     }
+    if (res.n_ops >= max_ops) res.hit_op_limit = 1;
 
     L.size_reduction(0, d);
-    read_gso(M, d, mu, r);
-    res.delta0    = compute_delta0(B, d, m, r);
-    res.final_var = profile_variance(r, d);
+    read_gso_wide(M, d, mu, r);
+    res.lll_reduced = is_lll_reduced(M, delta, LLL_DEF_ETA);
+    res.delta0      = compute_delta0(B, d, m, r);
+    res.final_var   = profile_variance(r, d);
     clock_gettime(CLOCK_MONOTONIC, &t1);
     res.elapsed_sec = (t1.tv_sec - t0.tv_sec) + (t1.tv_nsec - t0.tv_nsec) * 1e-9;
     free(mu);
     free(r);
-    free(wr);
-    free(wP);
     return out;
 }
 
@@ -1866,23 +1983,11 @@ static bkz_result_t run_bkz_standard(ZZ_mat<mpz_t> &B, int d, int m, double delt
 /* ================================================================== */
 /*  Geodesic Deep-LLL (G-DLLL)                                        */
 /*                                                                     */
-/*  Implements the ROI-weighted selector from Section 4.4 (G-DLLL).   */
-/*                                                                     */
-/*  Scoring (Proposition prop:roi):                                   */
-/*    S(k,j) = ΔV(k,j) / (k-j)   [variance per equivalent swap]      */
-/*                                                                     */
-/*  Hot-zone ordering:                                                 */
-/*    D_i = (p_i - p_{i+1}) - c_δ                                     */
-/*    Source positions k sorted by D_{k-1} descending.               */
-/*    Only the top hotzone_k = ceil(d/3) sources are scanned.         */
-/*                                                                     */
-/*  Variance-adaptive threshold (Eq. thermal_threshold):              */
-/*    Accept (k,j) only if ΔV(k,j) ≥ tau_frac * V(t), where          */
-/*    tau_frac = τ (the CLI --tau flag). The threshold tracks the     */
-/*    current variance V(t), so it shrinks as reduction proceeds.     */
-/*                                                                     */
-/*  Equivalent-swap count W = Σ(k_s - j_s) is tracked separately     */
-/*  in n_equiv_swaps; n_ops counts distinct insertions.               */
+/*  The canonical selector exhaustively maximizes                     */
+/*      S(k,j) = ΔV(k,j) / (k-j).                                  */
+/*  The two-position recurrence evaluates each candidate in O(1),    */
+/*  giving O(d^2) score work per iteration without a shortlist.       */
+/*  n_equiv_swaps records W = Σ(k_s-j_s).                          */
 /* ================================================================== */
 
 /*
@@ -1916,196 +2021,110 @@ typedef struct {
     double        alpha_used; /* c_delta used for deficit computation */
 } gdlll_result_t;
 
-static inline double gdlll_roi_score(double dV, int depth, double fixed_cost) {
-    return dV / (fixed_cost + (double)depth);
+static inline long double gdlll_roi_score(long double dV, int depth,
+                                          double fixed_cost) {
+    return dV / ((long double)fixed_cost + depth);
 }
 
 template <class FT>
-static gdlll_result_t
-run_gdlll_impl_scored(ZZ_mat<mpz_t> &B, int d, int m, double delta, int gso_flags,
-                      double tau_frac, int hotzone_k, double fixed_cost) {
+static gdlll_result_t run_gdlll_impl_scored(ZZ_mat<mpz_t> &B, int d, int m,
+                                            double delta, int gso_flags,
+                                            double fixed_cost) {
     gdlll_result_t gres;
     memset(&gres, 0, sizeof(gres));
     struct timespec t0, t1;
     clock_gettime(CLOCK_MONOTONIC, &t0);
 
-    /* Op cap scales with dimension: enough room for deep reduction without
-     * runaway on structured lattices (q-ary, GM).  Stagnation detection
-     * below catches early convergence regardless of this cap.            */
-    const int    max_ops = 1000 * d;
-    const double c_delta = 0.5 * log(1.0 / fmax(delta - 0.25, 1e-15));
-    gres.alpha_used      = c_delta;
+    const int max_ops = 1000 * d;
 
-    double          *mu = (double *)calloc((size_t)d * d, sizeof(double));
-    double          *r  = (double *)calloc((size_t)d, sizeof(double));
-    double          *wr = (double *)calloc((size_t)d, sizeof(double));
-    double          *wP = (double *)calloc((size_t)d, sizeof(double));
-    deficit_entry_t *de =
-        (deficit_entry_t *)malloc((size_t)(d - 1) * sizeof(deficit_entry_t));
+    long double *mu = (long double *)calloc((size_t)d * d, sizeof(long double));
+    long double *r  = (long double *)calloc((size_t)d, sizeof(long double));
 
     ZZ_mat<mpz_t>                 eu, eut;
     MatGSO<Z_NR<mpz_t>, FT>       M(B, eu, eut, gso_flags);
     LLLReduction<Z_NR<mpz_t>, FT> L(M, delta, LLL_DEF_ETA, LLL_DEFAULT);
 
-    /* ── Initial LLL: brings GSO norms into double range ── */
     int sr_from = 0;
-    if (gso_flags == GSO_INT_GRAM) {
-        L.lll(0, 0, d);
-        L.size_reduction(0, d);
-    }
-    read_gso(M, d, mu, r);
+    M.update_gso();
+    read_gso_wide(M, d, mu, r);
 
-    /* Compute initial variance V(0) for the adaptive threshold. */
-    double V0 = 0.0;
-    for (int i = 0; i < d; i++) {
-        double p = 0.5 * log(fmax(r[i], 1e-30));
-        V0 += p * p;
-    }
-    gres.V0 = V0;
+    long double V0 = 0.0L;
+    for (int i = 0; i < d; i++) V0 += variance_term(r[i]);
+    gres.V0 = (double)V0;
 
-    /* Number of source positions to scan per iteration. */
-    int K = (hotzone_k > 0) ? hotzone_k : (d / 3 + 1);
-    if (K > d - 1) K = d - 1;
-
-    /* ── Main loop ── */
     while (gres.base.n_ops < max_ops) {
         L.size_reduction(sr_from, d);
-        read_gso(M, d, mu, r);
+        read_gso_wide(M, d, mu, r);
 
-        /* Current profile variance → adaptive threshold. */
-        double Vt = 0.0;
-        for (int i = 0; i < d; i++) {
-            double p = 0.5 * log(fmax(r[i], 1e-30));
-            Vt += p * p;
-        }
-        /* Adaptive threshold: fraction of current profile energy.
-         * Suppresses micro-insertions early; decays as V(t) → V*. */
-        double dV_threshold = tau_frac * Vt;
-
-        /* Build hot-zone ordering: D_i = (p_i - p_{i+1}) - c_delta.
-         * Large positive D means slope steeper than GSA → high potential. */
-        for (int i = 0; i < d - 1; i++) {
-            double pi     = 0.5 * log(fmax(r[i], 1e-30));
-            double pi1    = 0.5 * log(fmax(r[i + 1], 1e-30));
-            de[i].deficit = (pi - pi1) - c_delta;
-            de[i].idx     = i + 1; /* source k = i+1 corresponds to gap i→i+1 */
-        }
-        qsort(de, (size_t)(d - 1), sizeof(deficit_entry_t), cmp_deficit_desc);
-
-        int    best_k = -1, best_j = -1;
-        double best_roi = 0.0;
-
-        /* Scan top-K hot-zone sources; for each, walk backward for best j. */
-        for (int qi = 0; qi < K; qi++) {
-            int k = de[qi].idx;
-            if (k <= 0 || k >= d) continue;
-
-            double Pc = r[k];
+        int         best_k = -1, best_j = -1;
+        int         fallback_k = -1;
+        long double best_roi   = 0.0L;
+        for (int k = 1; k < d; k++) {
+            long double P_next = r[k];
+            long double dV     = 0.0L;
             for (int j = k - 1; j >= 0; j--) {
-                double mkj = mu[k * d + j];
-                Pc += mkj * mkj * r[j];
+                long double mkj = mu[k * d + j];
+                long double Pc  = P_next + mkj * mkj * r[j];
+                dV              = extend_variance_drop(dV, r[j], P_next, Pc);
                 if (Pc < delta * r[j]) {
-                    int    depth = k - j;
-                    double dV    = score_deep_var(mu, r, d, k, j, wr, wP);
-                    if (dV < dV_threshold) continue; /* below adaptive bar */
-                    double roi = gdlll_roi_score(dV, depth, fixed_cost);
+                    if (j == k - 1 && fallback_k < 0) fallback_k = k;
+                    int         depth = k - j;
+                    long double roi   = gdlll_roi_score(dV, depth, fixed_cost);
                     if (roi > best_roi) {
                         best_roi = roi;
                         best_k   = k;
                         best_j   = j;
                     }
                 }
+                P_next = Pc;
             }
         }
-
         if (best_k < 0) {
-            /* Hot zone found nothing above threshold.  Single full scan:
-             * track best-above-threshold AND best-any-violation in one pass,
-             * so we never need a separate cleanup scan. */
-            double best_roi_any = 0.0;
-            int    any_k = -1, any_j = -1;
-            for (int k = 1; k < d; k++) {
-                double Pc = r[k];
-                for (int j = k - 1; j >= 0; j--) {
-                    double mkj = mu[k * d + j];
-                    Pc += mkj * mkj * r[j];
-                    if (Pc < delta * r[j]) {
-                        int    depth = k - j;
-                        double dV    = score_deep_var(mu, r, d, k, j, wr, wP);
-                        double roi   = gdlll_roi_score(dV, depth, fixed_cost);
-                        /* Track best above threshold */
-                        if (dV >= dV_threshold && roi > best_roi) {
-                            best_roi = roi;
-                            best_k   = k;
-                            best_j   = j;
-                        }
-                        /* Track best among any violation (fallback) */
-                        if (roi > best_roi_any) {
-                            best_roi_any = roi;
-                            any_k        = k;
-                            any_j        = j;
-                        }
-                    }
-                }
-            }
-            /* If nothing above threshold, fall back to best-any. */
-            if (best_k < 0) {
-                best_k = any_k;
-                best_j = any_j;
-            }
+            if (fallback_k < 0) break;
+            best_k = fallback_k;
+            best_j = fallback_k - 1;
+            gres.base.n_fallback_swaps++;
         }
-
-        if (best_k < 0) break; /* no Lovász violations → basis is reduced */
 
         M.move_row(best_k, best_j);
         gres.base.n_ops++;
         gres.base.n_equiv_swaps += best_k - best_j;
         sr_from = best_j;
     }
+    if (gres.base.n_ops >= max_ops) gres.base.hit_op_limit = 1;
 
     L.size_reduction(0, d);
-    read_gso(M, d, mu, r);
-    gres.base.delta0    = compute_delta0(B, d, m, r);
-    gres.base.final_var = profile_variance(r, d);
+    read_gso_wide(M, d, mu, r);
+    gres.base.lll_reduced = is_lll_reduced(M, delta, LLL_DEF_ETA);
+    gres.base.delta0      = compute_delta0(B, d, m, r);
+    gres.base.final_var   = profile_variance(r, d);
     clock_gettime(CLOCK_MONOTONIC, &t1);
     gres.base.elapsed_sec = (t1.tv_sec - t0.tv_sec) + (t1.tv_nsec - t0.tv_nsec) * 1e-9;
 
     free(mu);
     free(r);
-    free(wr);
-    free(wP);
-    free(de);
     return gres;
 }
 
-/*
- * Public wrapper.
- *   tau_frac : threshold ratio τ₀ (typical value: 0.01, i.e. 1% of V(t))
- *   hotzone_k: number of hot source positions to scan per iteration (0 = auto d/3)
- */
-static gdlll_result_t run_gdlll(ZZ_mat<mpz_t> &B, int d, int m, double delta,
-                                double tau_frac, int hotzone_k) {
+static gdlll_result_t run_gdlll(ZZ_mat<mpz_t> &B, int d, int m, double delta) {
     int mb = compute_max_bits(B, d, m);
     if (mb > 26) {
         FP_NR<mpfr_t>::set_prec(2 * mb + 64);
-        return run_gdlll_impl_scored<FP_NR<mpfr_t>>(B, d, m, delta, GSO_INT_GRAM,
-                                                    tau_frac, hotzone_k, 0.0);
+        return run_gdlll_impl_scored<FP_NR<mpfr_t>>(B, d, m, delta, GSO_INT_GRAM, 0.0);
     }
-    return run_gdlll_impl_scored<FP_NR<double>>(B, d, m, delta, GSO_DEFAULT, tau_frac,
-                                                hotzone_k, 0.0);
+    return run_gdlll_impl_scored<FP_NR<double>>(B, d, m, delta, GSO_DEFAULT, 0.0);
 }
 
 static gdlll_result_t run_gdlll_costaware(ZZ_mat<mpz_t> &B, int d, int m, double delta,
-                                          double tau_frac, int hotzone_k,
                                           double fixed_cost) {
     int mb = compute_max_bits(B, d, m);
     if (mb > 26) {
         FP_NR<mpfr_t>::set_prec(2 * mb + 64);
         return run_gdlll_impl_scored<FP_NR<mpfr_t>>(B, d, m, delta, GSO_INT_GRAM,
-                                                    tau_frac, hotzone_k, fixed_cost);
+                                                    fixed_cost);
     }
-    return run_gdlll_impl_scored<FP_NR<double>>(B, d, m, delta, GSO_DEFAULT, tau_frac,
-                                                hotzone_k, fixed_cost);
+    return run_gdlll_impl_scored<FP_NR<double>>(B, d, m, delta, GSO_DEFAULT,
+                                                fixed_cost);
 }
 
 template <class FT>
@@ -2246,10 +2265,12 @@ run_gdlll_residual_impl(ZZ_mat<mpz_t> &B, int d, int m, double delta, int gso_fl
         sr_from = best_j;
     }
 
+    if (gres.base.n_ops >= max_ops) gres.base.hit_op_limit = 1;
     L.size_reduction(0, d);
     read_gso(M, d, mu, r);
-    gres.base.delta0    = compute_delta0(B, d, m, r);
-    gres.base.final_var = profile_variance(r, d);
+    gres.base.lll_reduced = is_lll_reduced(M, delta, LLL_DEF_ETA);
+    gres.base.delta0      = compute_delta0(B, d, m, r);
+    gres.base.final_var   = profile_variance(r, d);
     clock_gettime(CLOCK_MONOTONIC, &t1);
     gres.base.elapsed_sec = (t1.tv_sec - t0.tv_sec) + (t1.tv_nsec - t0.tv_nsec) * 1e-9;
 

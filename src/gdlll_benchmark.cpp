@@ -10,14 +10,10 @@
  *   n_equiv_swaps — total cascade depth W = Σ(k_s - j_s)  ← primary metric
  *                   Lower W means fewer equivalent adjacent-swap operations.
  *
- * G-DLLL parameters (defaults calibrated to Gaussian lattices, d = 40..160):
- *   --tau    TAU      variance-adaptive threshold ratio (default 0.01)
- *   --hotk   K        number of hot-zone sources scanned per iteration (0=auto)
- *
  * Usage:
  *   ./gdlll_benchmark [--dims 20,40,...] [--nlat N] [--seed 42] [--delta 0.99]
  *                     [--families uniform,gaussian,qary,goldstein-mayer]
- *                     [--tau 0.01] [--hotk 0] [-o out.json]
+ *                     [-o out.json]
  *
  * Build (after updating CMakeLists.txt):
  *   cd build && cmake .. && make gdlll_benchmark
@@ -28,6 +24,7 @@
 #include <cmath>
 #include <ctime>
 #include <climits>
+#include <vector>
 #include <omp.h>
 
 #include "lattice_gen.h"
@@ -40,15 +37,25 @@ typedef struct {
     double mean, std;
 } stat_t;
 
-static stat_t compute_stat(const double *vals, int n) {
-    stat_t s = {0.0, 0.0};
-    for (int i = 0; i < n; i++) s.mean += vals[i];
-    s.mean /= n;
+static stat_t compute_stat(const double *vals, const double *invalid, int n) {
+    stat_t s     = {0.0, 0.0};
+    int    count = 0;
     for (int i = 0; i < n; i++) {
+        if (invalid[i] != 0.0) continue;
+        s.mean += vals[i];
+        count++;
+    }
+    if (count == 0) {
+        s.mean = s.std = NAN;
+        return s;
+    }
+    s.mean /= count;
+    for (int i = 0; i < n; i++) {
+        if (invalid[i] != 0.0) continue;
         double d = vals[i] - s.mean;
         s.std += d * d;
     }
-    s.std = sqrt(s.std / n);
+    s.std = sqrt(s.std / count);
     return s;
 }
 
@@ -79,27 +86,40 @@ static void ji(FILE *f, const char *n, int v) {
 }
 static void jd(FILE *f, const char *n, double v) {
     jk(f, n);
-    fprintf(f, "%.10g", v);
+    if (isfinite(v)) fprintf(f, "%.10g", v);
+    else fprintf(f, "null");
 }
 
 static void json_alg(FILE *f, const char *name, const double *ops, const double *eqs,
-                     const double *times, const double *d0s, const double *vars,
-                     int n) {
+                     const double *fallback, const double *limits,
+                     const double *reduced, const double *times, const double *d0s,
+                     const double *vars, int n) {
     jko(f, name);
     stat_t s;
-    s = compute_stat(ops, n);
+    s = compute_stat(ops, limits, n);
     jd(f, "mean_ops", s.mean);
     jd(f, "std_ops", s.std);
-    s = compute_stat(eqs, n);
+    s = compute_stat(eqs, limits, n);
     jd(f, "mean_equiv_swaps", s.mean);
     jd(f, "std_equiv_swaps", s.std);
-    s = compute_stat(times, n);
+    s = compute_stat(fallback, limits, n);
+    jd(f, "mean_fallback_swaps", s.mean);
+    jd(f, "std_fallback_swaps", s.std);
+    int limit_hits = 0;
+    for (int i = 0; i < n; i++) limit_hits += (limits[i] != 0.0);
+    int non_lll_outputs = 0;
+    for (int i = 0; i < n; i++)
+        non_lll_outputs += (limits[i] == 0.0 && reduced[i] == 0.0);
+    ji(f, "completed_runs", n - limit_hits);
+    ji(f, "limit_hits", limit_hits);
+    ji(f, "non_lll_outputs", non_lll_outputs);
+    s = compute_stat(times, limits, n);
     jd(f, "mean_time", s.mean);
     jd(f, "std_time", s.std);
-    s = compute_stat(d0s, n);
+    s = compute_stat(d0s, limits, n);
     jd(f, "mean_delta0", s.mean);
     jd(f, "std_delta0", s.std);
-    s = compute_stat(vars, n);
+    s = compute_stat(vars, limits, n);
     jd(f, "mean_final_var", s.mean);
     jd(f, "std_final_var", s.std);
     jc(f);
@@ -147,18 +167,13 @@ static const char *ALG_NAMES[N_ALG] = {"LLL",       "Deep-Var",
                                        "G-DLLL",    "G-DLLL-CA",
                                        "G-DLLL-RT", "Schur-K"};
 
-/* tau_frac and hotzone_k are set from CLI and captured in lambdas below
- * (C++11 lambdas or plain wrapping with a shared global). */
-static double g_tau          = 0.01;
-static int    g_hotk         = 0;
-static double g_delta        = 0.99;
-static double g_fixed        = 8.0;
-static int    g_targetb      = 0;
-static double g_hybrid_beta  = 0.0; /* Door-1 hybrid: 0 = pure Thermal-Adaptive */
-static int    g_sched_period = 0;   /* 0 = default d/4 inside impl */
+/* Parameters used only by the exploratory appendix variants. */
+static double g_tau     = 0.01;
+static double g_fixed   = 8.0;
+static int    g_targetb = 0;
 
 static deep_result_t wrap_lll(ZZ_mat<mpz_t> &B, int d, int m, double delta) {
-    return run_fplll_lll(B, d, m, delta);
+    return run_lll_standard(B, d, m, delta);
 }
 static deep_result_t wrap_deepvar(ZZ_mat<mpz_t> &B, int d, int m, double delta) {
     return run_deep_var(B, d, m, delta);
@@ -167,17 +182,15 @@ static deep_result_t wrap_ssgg(ZZ_mat<mpz_t> &B, int d, int m, double delta) {
     return run_deep_ssgg(B, d, m, delta);
 }
 static deep_result_t wrap_thermal(ZZ_mat<mpz_t> &B, int d, int m, double delta) {
-    /* A = 2^γ = 4.0, γ = 2.0 (q-ary anchor condition, Section 4.3) */
-    if (g_hybrid_beta > 0.0)
-        return run_deep_hybrid(B, d, m, delta, 4.0, 2.0, g_hybrid_beta);
-    return run_deep_inita(B, d, m, delta, 4.0, 2.0);
+    /* γ = 2 gives the q-ary anchor α(CV=1) = 1. */
+    return run_deep_inita(B, d, m, delta, 2.0);
 }
 static deep_result_t wrap_gdlll(ZZ_mat<mpz_t> &B, int d, int m, double delta) {
-    gdlll_result_t gr = run_gdlll(B, d, m, delta, g_tau, g_hotk);
+    gdlll_result_t gr = run_gdlll(B, d, m, delta);
     return gr.base;
 }
 static deep_result_t wrap_gdlll_ca(ZZ_mat<mpz_t> &B, int d, int m, double delta) {
-    gdlll_result_t gr = run_gdlll_costaware(B, d, m, delta, g_tau, g_hotk, g_fixed);
+    gdlll_result_t gr = run_gdlll_costaware(B, d, m, delta, g_fixed);
     return gr.base;
 }
 static deep_result_t wrap_gdlll_rt(ZZ_mat<mpz_t> &B, int d, int m, double delta) {
@@ -209,9 +222,10 @@ int main(int argc, char **argv) {
     char     families[8][32];
     strcpy(families[0], "gaussian");
     strcpy(families[1], "qary");
-    int         n_fam    = 2;
-    const char *outpath  = NULL;
-    int         nthreads = 0;
+    int         n_fam     = 2;
+    const char *outpath   = NULL;
+    int         nthreads  = 0;
+    bool        main_only = false;
 
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--dims") && i + 1 < argc)
@@ -221,20 +235,15 @@ int main(int argc, char **argv) {
             seed = (unsigned)atoi(argv[++i]);
         else if (!strcmp(argv[i], "--delta") && i + 1 < argc) delta = atof(argv[++i]);
         else if (!strcmp(argv[i], "--tau") && i + 1 < argc) g_tau = atof(argv[++i]);
-        else if (!strcmp(argv[i], "--hotk") && i + 1 < argc) g_hotk = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--fixed-cost") && i + 1 < argc)
             g_fixed = atof(argv[++i]);
         else if (!strcmp(argv[i], "--target-b") && i + 1 < argc)
             g_targetb = atoi(argv[++i]);
-        else if (!strcmp(argv[i], "--hybrid-beta") && i + 1 < argc)
-            g_hybrid_beta = atof(argv[++i]);
-        else if (!strcmp(argv[i], "--sched-period") && i + 1 < argc)
-            g_sched_period = atoi(argv[++i]);
-
         else if (!strcmp(argv[i], "--families") && i + 1 < argc)
             n_fam = parse_strings(argv[++i], families, 8);
         else if (!strcmp(argv[i], "--nthreads") && i + 1 < argc)
             nthreads = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--main-only")) main_only = true;
         else if (!strcmp(argv[i], "-o") && i + 1 < argc) outpath = argv[++i];
         else if (!strcmp(argv[i], "--help") || !strcmp(argv[i], "-h")) {
             printf(
@@ -243,19 +252,36 @@ int main(int argc, char **argv) {
                 "  --nlat   N          lattices per cell (-1=auto)\n"
                 "  --seed   S          RNG seed (default 42)\n"
                 "  --delta  D          LLL delta (default 0.99)\n"
-                "  --tau    T          G-DLLL variance threshold ratio (default 0.01)\n"
-                "  --hotk   K          G-DLLL hot-zone scan count (0=auto=d/3)\n"
+                "  --tau    T          threshold for G-DLLL-RT only (default 0.01)\n"
                 "  --fixed-cost C      cost-aware ROI offset for G-DLLL-CA (default "
                 "8.0)\n"
                 "  --target-b B        residual shortlist size for G-DLLL-RT (0=auto)\n"
 
                 "  --families f1,...   families (default: gaussian,qary)\n"
                 "  --nthreads T        OpenMP threads (0=auto)\n"
+                "  --main-only         run LLL and the four main selectors only\n"
                 "  -o file.json        output path (default: stdout)\n");
             return 0;
+        } else {
+            fprintf(stderr, "Unknown or incomplete option: %s\n", argv[i]);
+            return 2;
         }
     }
-    g_delta = delta;
+    bool bad_dimension = n_dims == 0;
+    for (int i = 0; i < n_dims; i++) bad_dimension = bad_dimension || dims[i] < 2;
+    bool bad_family = n_fam == 0;
+    for (int i = 0; i < n_fam; i++) {
+        bool known = !strcmp(families[i], "uniform") ||
+                     !strcmp(families[i], "gaussian") || !strcmp(families[i], "qary") ||
+                     !strcmp(families[i], "goldstein-mayer");
+        bad_family = bad_family || !known;
+    }
+    if (delta <= 0.25 || delta >= 1.0 || g_tau < 0.0 || g_fixed < 0.0 ||
+        g_targetb < 0 || n_lat < -1 || n_lat == 0 || nthreads < 0 || bad_family ||
+        bad_dimension) {
+        fprintf(stderr, "Invalid benchmark parameter.\n");
+        return 2;
+    }
 
     FILE *out = outpath ? fopen(outpath, "w") : stdout;
     if (!out) {
@@ -268,15 +294,8 @@ int main(int argc, char **argv) {
 
     fprintf(stderr,
             "G-DLLL benchmark: %d families, %d dims, delta=%.2f, "
-            "tau=%.4f, hotk=%d, fixed_cost=%.2f, target_b=%d, threads=%d\n",
-            n_fam, n_dims, delta, g_tau, g_hotk, g_fixed, g_targetb, actual_threads);
-
-    const int max_lat = 400;
-    double   *a_ops   = (double *)calloc((size_t)max_lat, sizeof(double));
-    double   *a_eqs   = (double *)calloc((size_t)max_lat, sizeof(double));
-    double   *a_time  = (double *)calloc((size_t)max_lat, sizeof(double));
-    double   *a_d0    = (double *)calloc((size_t)max_lat, sizeof(double));
-    double   *a_var   = (double *)calloc((size_t)max_lat, sizeof(double));
+            "RT_tau=%.4f, fixed_cost=%.2f, target_b=%d, threads=%d\n",
+            n_fam, n_dims, delta, g_tau, g_fixed, g_targetb, actual_threads);
 
     /* Top-level JSON object */
     jo(out);
@@ -286,12 +305,13 @@ int main(int argc, char **argv) {
     jko(out, "meta");
     ji(out, "seed", (int)seed);
     jd(out, "delta", delta);
-    jd(out, "tau", g_tau);
-    ji(out, "hotk", g_hotk);
+    jd(out, "residual_tau", g_tau);
+    jk(out, "canonical_gdlll_scan");
+    fprintf(out, "\"exhaustive\"");
     jd(out, "fixed_cost", g_fixed);
     ji(out, "target_b", g_targetb);
-    jd(out, "hybrid_beta", g_hybrid_beta);
     ji(out, "threads", actual_threads);
+    ji(out, "main_only", main_only ? 1 : 0);
     jc(out);
     fprintf(out, "\n");
 
@@ -306,6 +326,11 @@ int main(int argc, char **argv) {
                           : (d <= 80)  ? 12 * actual_threads
                           : (d <= 120) ? 6 * actual_threads
                                        : 3 * actual_threads;
+
+            std::vector<double> a_ops(n_lat_d), a_eqs(n_lat_d);
+            std::vector<double> a_fallback(n_lat_d), a_limits(n_lat_d);
+            std::vector<double> a_reduced(n_lat_d);
+            std::vector<double> a_time(n_lat_d), a_d0(n_lat_d), a_var(n_lat_d);
 
             char dim_str[16];
             snprintf(dim_str, sizeof(dim_str), "%d", d);
@@ -329,7 +354,8 @@ int main(int argc, char **argv) {
                 }
             }
 
-            for (int ai = 0; ai < N_ALG; ai++) {
+            int n_algorithms = main_only ? 5 : N_ALG;
+            for (int ai = 0; ai < n_algorithms; ai++) {
 /* Run in parallel over lattice instances */
 #pragma omp parallel for schedule(dynamic)
                 for (int li = 0; li < n_lat_d; li++) {
@@ -337,12 +363,16 @@ int main(int argc, char **argv) {
                     deep_result_t res = ALG_FNS[ai](B, d, d, delta);
                     a_ops[li]         = (double)res.n_ops;
                     a_eqs[li]         = (double)res.n_equiv_swaps;
+                    a_fallback[li]    = (double)res.n_fallback_swaps;
+                    a_limits[li]      = (double)res.hit_op_limit;
+                    a_reduced[li]     = (double)res.lll_reduced;
                     a_time[li]        = res.elapsed_sec;
                     a_d0[li]          = res.delta0;
                     a_var[li]         = res.final_var;
                 }
-                json_alg(out, ALG_NAMES[ai], a_ops, a_eqs, a_time, a_d0, a_var,
-                         n_lat_d);
+                json_alg(out, ALG_NAMES[ai], a_ops.data(), a_eqs.data(),
+                         a_fallback.data(), a_limits.data(), a_reduced.data(),
+                         a_time.data(), a_d0.data(), a_var.data(), n_lat_d);
                 fprintf(out, "\n");
                 fflush(out);
             }
@@ -363,10 +393,5 @@ int main(int argc, char **argv) {
     fprintf(out, "\n");
 
     if (outpath) fclose(out);
-    free(a_ops);
-    free(a_eqs);
-    free(a_time);
-    free(a_d0);
-    free(a_var);
     return 0;
 }

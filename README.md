@@ -12,9 +12,20 @@ loop and differ only in the score they maximise:
 | Thermal-Adaptive    | $\Delta\sum r_i^{\alpha}$, $\alpha$ from initial CV |
 | G-DLLL              | $\Delta V/(k-j)$                                    |
 
+Each iteration starts by size-reducing the current basis. It then exhaustively
+scans every generalized-Lovász-admissible insertion and accepts only strict
+descent in the relevant potential. G-DLLL uses the exact global
+`argmax ΔV/(k-j)` rule. Candidate scores are updated in constant time as the
+insertion point moves, so a full scan takes quadratic score work per iteration.
+If no candidate gives strict descent but an adjacent Lovász violation remains,
+the loop performs that adjacent swap. This makes the returned basis LLL-reduced
+without changing the primary score.
+
 The C++ benchmark in `src/` is the canonical implementation built on
-[fplll](https://github.com/fplll/fplll); the Python scripts in `scripts/`
-drive the runs and produce the figures and tables referenced in the paper.
+[fplll](https://github.com/fplll/fplll). It reports zero-score fallback swaps,
+operation-limit hits, and failed final LLL checks. Statistics exclude runs that
+reach the operation limit. The Python scripts in `scripts/` drive the runs and
+produce the figures and tables referenced in the paper.
 
 ## Build
 
@@ -35,8 +46,10 @@ python scripts/generate_gdlll_plots.py  # writes figures/*.pdf
 python scripts/generate_paper_tables.py # writes figures/tables/*.tex
 ```
 
-A single run of the full suite takes a few hours on 12 threads. For a
-quick smoke test, invoke `src/build/gdlll_benchmark --dims 40 --nlat 4
+The runner uses 30 lattices per cell and only the five algorithms reported in
+the main comparison. It validates every required cell before replacing the
+previous result file. A single run takes a few hours on 12 threads. For a quick
+smoke test, invoke `src/build/gdlll_benchmark --dims 40 --nlat 4 --main-only
 --families gaussian -o /tmp/q.json` directly.
 
 ## Layout
