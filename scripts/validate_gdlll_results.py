@@ -23,6 +23,9 @@ METRICS = [
     "std_delta0",
     "mean_final_var",
     "std_final_var",
+    "mean_kappa_f",
+    "std_kappa_f",
+    "max_kappa_f",
 ]
 
 
@@ -32,6 +35,9 @@ def validate_main_results(data: dict, expected_runs: int = 30) -> None:
         raise ValueError("canonical G-DLLL must use an exhaustive scan")
     if meta.get("main_only") != 1:
         raise ValueError("paper results must be produced with --main-only")
+    rho = meta.get("score_drop_fraction", math.nan)
+    if not math.isclose(rho, 1e-6, rel_tol=0.0, abs_tol=1e-15):
+        raise ValueError("paper results must use --score-drop 1e-6")
 
     results = data.get("results")
     if not isinstance(results, dict):
@@ -71,6 +77,14 @@ def validate_main_results(data: dict, expected_runs: int = 30) -> None:
                         raise ValueError(
                             f"{family} d={dimension} {algorithm}: invalid {metric}"
                         )
+                if (
+                    algorithm != "LLL"
+                    and record["max_kappa_f"] > rho * (1 + 1e-8) + 1e-15
+                ):
+                    raise ValueError(
+                        f"{family} d={dimension} {algorithm}: terminal "
+                        f"kappa_F={record['max_kappa_f']:.6g} exceeds rho={rho:.6g}"
+                    )
 
 
 def main() -> int:

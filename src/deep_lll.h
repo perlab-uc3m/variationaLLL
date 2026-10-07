@@ -2,17 +2,17 @@
  * deep_lll.h — LLL selectors: adjacent-swap and deep-insertion.
  *
  * Adjacent selectors:
- *   LLL          : fplll's sequential LLL (via LLLReduction::lll), swap-counted
+ *   LLL          : fplll's sequential LLL (via LLLReduction::lll), row-move and depth-counted
  *   Greedy-Var   : maximise Δ(Σ p²)  among all Lovász violations
  *   Greedy-H     : maximise ΔH       among all Lovász violations
  *   Toda-Greedy  : maximise −ΔC      (curvature decrease)
  *   GSA-Target   : maximise residual decrease w.r.t. OLS line
  *
  * Deep-insertion selectors:
- *   Deep-Var     : maximise Δ(Σ p²)
+ *   Deep-Var     : maximise the centered log-energy drop ΔV
  *   SS-GG        : maximise Δ(Σ r_i), scored by the closed-form
  *                  recurrence S ← S + μ²_{k,j} r_j (r_j/D_j − 1)
- *                  fused with the admissibility scan (O(d²)/step).
+ *                  during the global insertion scan (O(d²)/step).
  *   Init-Adaptive: power-law α from initial CV, maximise Δ(Σ r^α)
  *   Batch-Deep   : sequential deepest-valid insertion
  *   Deficit-Greedy: maximise deficit decrease
@@ -81,12 +81,14 @@ using namespace fplll;
 typedef struct {
     int    n_ops;            /* swap / insertion count              */
     int    n_equiv_swaps;    /* cumulative depth for deep moves     */
-    int    n_fallback_swaps; /* zero-score adjacent LLL swaps        */
+    int    n_fallback_swaps; /* subthreshold adjacent LLL swaps      */
     int    hit_op_limit;     /* one if the implementation cap fired */
     int    lll_reduced;      /* one if the final basis passes fplll  */
     double delta0;           /* root Hermite factor                 */
     double final_var;        /* log-norm profile variance           */
+    double kappa_f;          /* final maximum relative score drop   */
     double elapsed_sec;      /* wall-clock time                     */
+    double alpha_used;       /* thermal exponent actually used      */
 } deep_result_t;
 
 typedef struct {
@@ -482,6 +484,68 @@ static inline long double power_term(long double r, double alpha) {
     return powl(positive_norm(r), (long double)alpha);
 }
 
+static long double centered_log_energy(const long double *r, int d) {
+    long double mean = 0.0L;
+    for (int i = 0; i < d; i++) mean += 0.5L * logl(positive_norm(r[i]));
+    mean /= d;
+
+    long double energy = 0.0L;
+    for (int i = 0; i < d; i++) {
+        long double p = 0.5L * logl(positive_norm(r[i])) - mean;
+        energy += p * p;
+    }
+    return energy;
+}
+
+static long double power_energy(const long double *r, int d, double alpha) {
+    long double energy = 0.0L;
+    if (alpha == 1.0) {
+        for (int i = 0; i < d; i++) energy += positive_norm(r[i]);
+        return energy;
+    }
+    for (int i = 0; i < d; i++) energy += power_term(r[i], alpha);
+    return energy;
+}
+
+static double relative_score_residual(long double best_drop, long double energy) {
+    if (best_drop <= 0.0L) return 0.0;
+    if (energy <= 0.0L) return std::numeric_limits<double>::infinity();
+    return (double)(best_drop / energy);
+}
+
+static double max_relative_variance_drop(const long double *mu, const long double *r,
+                                         int d) {
+    long double best = 0.0L;
+    for (int k = 1; k < d; k++) {
+        long double P_next = r[k];
+        long double drop   = 0.0L;
+        for (int j = k - 1; j >= 0; j--) {
+            long double mkj = mu[k * d + j];
+            long double Pc  = P_next + mkj * mkj * r[j];
+            drop            = extend_variance_drop(drop, r[j], P_next, Pc);
+            if (drop > best) best = drop;
+            P_next = Pc;
+        }
+    }
+    return relative_score_residual(best, centered_log_energy(r, d));
+}
+
+static double max_relative_ss_drop(const long double *mu, const long double *r, int d) {
+    long double best = 0.0L;
+    for (int k = 1; k < d; k++) {
+        long double Pc   = r[k];
+        long double drop = 0.0L;
+        for (int j = k - 1; j >= 0; j--) {
+            long double mkj  = mu[k * d + j];
+            long double term = mkj * mkj * r[j];
+            Pc += term;
+            drop += term * (r[j] / positive_norm(Pc) - 1.0L);
+            if (drop > best) best = drop;
+        }
+    }
+    return relative_score_residual(best, power_energy(r, d, 1.0));
+}
+
 static inline long double extend_power_drop(long double drop, long double rj,
                                             long double P_next, long double P_cur,
                                             double alpha) {
@@ -490,7 +554,24 @@ static inline long double extend_power_drop(long double drop, long double rj,
            power_term(P_cur, alpha) - power_term(shifted, alpha);
 }
 
-/* Deep-Var: Δ(Σp²) over the span [j..k]. */
+static double max_relative_power_drop(const long double *mu, const long double *r,
+                                      int d, double alpha) {
+    long double best = 0.0L;
+    for (int k = 1; k < d; k++) {
+        long double P_next = r[k];
+        long double drop   = 0.0L;
+        for (int j = k - 1; j >= 0; j--) {
+            long double mkj = mu[k * d + j];
+            long double Pc  = P_next + mkj * mkj * r[j];
+            drop            = extend_power_drop(drop, r[j], P_next, Pc, alpha);
+            if (drop > best) best = drop;
+            P_next = Pc;
+        }
+    }
+    return relative_score_residual(best, power_energy(r, d, alpha));
+}
+
+/* Deep-Var: ΔV over [j..k], equal to Δ(Σp²) at fixed log-volume. */
 static double score_deep_var(const double *mu, const double *r, int d, int k, int j,
                              double *wr, double *wP) {
     int span = k - j + 1;
@@ -538,8 +619,21 @@ static double score_deep_deficit(const double *mu, const double *r, int d, int k
 /* ================================================================== */
 
 /* ================================================================== */
-/*  Standard LLL (fplll LLLReduction, swap-counted)                   */
+/*  Standard LLL (fplll LLLReduction, row-move and depth-counted)                   */
 /* ================================================================== */
+
+/* fplll's n_swaps counts batched row moves, not adjacent transpositions.
+ * Observe the virtual GSO row operation to record its actual total depth. */
+template <class ZT, class FT>
+class DepthCountingGSO : public MatGSO<ZT, FT> {
+  public:
+    using MatGSO<ZT, FT>::MatGSO;
+    int equivalent_swaps = 0;
+    void move_row(int old_r, int new_r) override {
+        equivalent_swaps += std::abs(old_r - new_r);
+        MatGSO<ZT, FT>::move_row(old_r, new_r);
+    }
+};
 
 template <class FT>
 static deep_result_t run_lll_standard_impl(ZZ_mat<mpz_t> &B, int d, int m, double delta,
@@ -553,14 +647,14 @@ static deep_result_t run_lll_standard_impl(ZZ_mat<mpz_t> &B, int d, int m, doubl
     long double *r  = (long double *)calloc((size_t)d, sizeof(long double));
 
     ZZ_mat<mpz_t>                 eu, eut;
-    MatGSO<Z_NR<mpz_t>, FT>       M(B, eu, eut, gso_flags);
+    DepthCountingGSO<Z_NR<mpz_t>, FT> M(B, eu, eut, gso_flags);
     LLLReduction<Z_NR<mpz_t>, FT> L(M, delta, LLL_DEF_ETA, LLL_DEFAULT);
 
-    /* Run fplll's sequential LLL; n_swaps is the adjacent-swap count. */
+    /* n_swaps is the row-move count; the GSO observer measures depth. */
     if (!L.lll(0, 0, d)) fprintf(stderr, "LLL warning: status %d\n", L.status);
 
     res.n_ops         = L.n_swaps;
-    res.n_equiv_swaps = L.n_swaps;
+    res.n_equiv_swaps = M.equivalent_swaps;
 
     /* Ensure full GSO validity for final metric read. */
     M.update_gso();
@@ -875,7 +969,7 @@ static deep_result_t run_lll_gsa_target(ZZ_mat<mpz_t> &B, int d, int m, double d
 
 template <class FT>
 static deep_result_t run_deep_var_impl(ZZ_mat<mpz_t> &B, int d, int m, double delta,
-                                       int gso_flags) {
+                                       int gso_flags, long double drop_fraction) {
     deep_result_t res;
     memset(&res, 0, sizeof(res));
     struct timespec t0, t1;
@@ -896,6 +990,7 @@ static deep_result_t run_deep_var_impl(ZZ_mat<mpz_t> &B, int d, int m, double de
         int         best_k = -1, best_j = -1;
         int         fallback_k = -1;
         long double best       = 0.0L;
+        long double min_drop   = drop_fraction * centered_log_energy(r, d);
         for (int k = 1; k < d; k++) {
             long double P_next = r[k];
             long double drop   = 0.0L;
@@ -903,13 +998,13 @@ static deep_result_t run_deep_var_impl(ZZ_mat<mpz_t> &B, int d, int m, double de
                 long double mkj = mu[k * d + j];
                 long double Pc  = P_next + mkj * mkj * r[j];
                 drop            = extend_variance_drop(drop, r[j], P_next, Pc);
-                if (Pc < delta * r[j]) {
-                    if (j == k - 1 && fallback_k < 0) fallback_k = k;
-                    if (drop > best) {
-                        best   = drop;
-                        best_k = k;
-                        best_j = j;
-                    }
+                if (j == k - 1 && Pc < delta * r[j] && fallback_k < 0) {
+                    fallback_k = k;
+                }
+                if (drop > min_drop && drop > best) {
+                    best   = drop;
+                    best_k = k;
+                    best_j = j;
                 }
                 P_next = Pc;
             }
@@ -934,6 +1029,7 @@ static deep_result_t run_deep_var_impl(ZZ_mat<mpz_t> &B, int d, int m, double de
     res.lll_reduced = is_lll_reduced(M, delta, LLL_DEF_ETA);
     res.delta0      = compute_delta0(B, d, m, r);
     res.final_var   = profile_variance(r, d);
+    res.kappa_f     = max_relative_variance_drop(mu, r, d);
     clock_gettime(CLOCK_MONOTONIC, &t1);
     res.elapsed_sec = (t1.tv_sec - t0.tv_sec) + (t1.tv_nsec - t0.tv_nsec) * 1e-9;
     free(mu);
@@ -941,13 +1037,15 @@ static deep_result_t run_deep_var_impl(ZZ_mat<mpz_t> &B, int d, int m, double de
     return res;
 }
 
-static deep_result_t run_deep_var(ZZ_mat<mpz_t> &B, int d, int m, double delta) {
+static deep_result_t run_deep_var(ZZ_mat<mpz_t> &B, int d, int m, double delta,
+                                  long double drop_fraction) {
     int mb = compute_max_bits(B, d, m);
     if (mb > 26) {
         FP_NR<mpfr_t>::set_prec(2 * mb + 64);
-        return run_deep_var_impl<FP_NR<mpfr_t>>(B, d, m, delta, GSO_INT_GRAM);
+        return run_deep_var_impl<FP_NR<mpfr_t>>(B, d, m, delta, GSO_INT_GRAM,
+                                                drop_fraction);
     }
-    return run_deep_var_impl<FP_NR<double>>(B, d, m, delta, GSO_DEFAULT);
+    return run_deep_var_impl<FP_NR<double>>(B, d, m, delta, GSO_DEFAULT, drop_fraction);
 }
 
 /* ================================================================== */
@@ -956,15 +1054,14 @@ static deep_result_t run_deep_var(ZZ_mat<mpz_t> &B, int d, int m, double delta) 
 /*  ΔSS is evaluated by the closed-form recurrence                    */
 /*      S ← S + μ²_{k,j} r_j (r_j / D_j − 1),                         */
 /*  with D_k = r_k, D_j = D_{j+1} + μ²_{k,j} r_j, accumulated in the  */
-/*  same descending-j loop that tests admissibility (Pc ≡ D_j). The   */
-/*  score is therefore exact, O(1) per candidate, and shares its      */
-/*  arithmetic with the admissibility test. Reference: Yasuda &       */
-/*  Yamaguchi, Eq. 5, as implemented in Bhattacherjee et al. 2025.    */
+/*  descending-j candidate scan (Pc ≡ D_j). The score is exact and   */
+/*  costs O(1) per candidate. Reference: Yasuda & Yamaguchi, Eq. 5,   */
+/*  as implemented in Bhattacherjee et al. 2025.                     */
 /* ================================================================== */
 
 template <class FT>
 static deep_result_t run_deep_ssgg_impl(ZZ_mat<mpz_t> &B, int d, int m, double delta,
-                                        int gso_flags) {
+                                        int gso_flags, long double drop_fraction) {
     deep_result_t res;
     memset(&res, 0, sizeof(res));
     struct timespec t0, t1;
@@ -986,6 +1083,7 @@ static deep_result_t run_deep_ssgg_impl(ZZ_mat<mpz_t> &B, int d, int m, double d
         int         best_k = -1, best_j = -1;
         int         fallback_k = -1;
         long double best       = 0.0L;
+        long double min_drop   = drop_fraction * power_energy(r, d, 1.0);
         for (int k = 1; k < d; k++) {
             long double Pc = r[k];
             long double S  = 0.0L;
@@ -995,13 +1093,13 @@ static deep_result_t run_deep_ssgg_impl(ZZ_mat<mpz_t> &B, int d, int m, double d
                 Pc += term;
                 /* Pc now equals D_j; add the j-th ΔSS contribution. */
                 S += term * (r[j] / positive_norm(Pc) - 1.0L);
-                if (Pc < delta * r[j]) {
-                    if (j == k - 1 && fallback_k < 0) fallback_k = k;
-                    if (S > best) {
-                        best   = S;
-                        best_k = k;
-                        best_j = j;
-                    }
+                if (j == k - 1 && Pc < delta * r[j] && fallback_k < 0) {
+                    fallback_k = k;
+                }
+                if (S > min_drop && S > best) {
+                    best   = S;
+                    best_k = k;
+                    best_j = j;
                 }
             }
         }
@@ -1024,6 +1122,7 @@ static deep_result_t run_deep_ssgg_impl(ZZ_mat<mpz_t> &B, int d, int m, double d
     res.lll_reduced = is_lll_reduced(M, delta, LLL_DEF_ETA);
     res.delta0      = compute_delta0(B, d, m, r);
     res.final_var   = profile_variance(r, d);
+    res.kappa_f     = max_relative_ss_drop(mu, r, d);
     clock_gettime(CLOCK_MONOTONIC, &t1);
     res.elapsed_sec = (t1.tv_sec - t0.tv_sec) + (t1.tv_nsec - t0.tv_nsec) * 1e-9;
     free(mu);
@@ -1031,13 +1130,16 @@ static deep_result_t run_deep_ssgg_impl(ZZ_mat<mpz_t> &B, int d, int m, double d
     return res;
 }
 
-static deep_result_t run_deep_ssgg(ZZ_mat<mpz_t> &B, int d, int m, double delta) {
+static deep_result_t run_deep_ssgg(ZZ_mat<mpz_t> &B, int d, int m, double delta,
+                                   long double drop_fraction) {
     int mb = compute_max_bits(B, d, m);
     if (mb > 26) {
         FP_NR<mpfr_t>::set_prec(2 * mb + 64);
-        return run_deep_ssgg_impl<FP_NR<mpfr_t>>(B, d, m, delta, GSO_INT_GRAM);
+        return run_deep_ssgg_impl<FP_NR<mpfr_t>>(B, d, m, delta, GSO_INT_GRAM,
+                                                 drop_fraction);
     }
-    return run_deep_ssgg_impl<FP_NR<double>>(B, d, m, delta, GSO_DEFAULT);
+    return run_deep_ssgg_impl<FP_NR<double>>(B, d, m, delta, GSO_DEFAULT,
+                                             drop_fraction);
 }
 
 /* ================================================================== */
@@ -1162,9 +1264,29 @@ static deep_result_t run_deep_schurK(ZZ_mat<mpz_t> &B, int d, int m, double delt
 /*  alpha = (2/(1+CV_0))^gamma, fixed from the initial profile.      */
 /* ================================================================== */
 
+typedef struct {
+    int         k;
+    int         j;
+    long double drop;
+    long double potential_drop;
+} thermal_candidate_t;
+
+typedef enum {
+    THERMAL_EXACT,
+    THERMAL_SHALLOW_BAND,
+    THERMAL_POTENTIAL_BAND
+} thermal_tie_mode_t;
+
+/* If positive, Thermal runs use this exponent instead of the calibration. */
+static double g_thermal_force_alpha = -1.0;
+/* If nonzero, Thermal uses precomputed powers: one power per candidate. */
+static int g_thermal_fastpow = 0;
+
 template <class FT>
 static deep_result_t run_deep_inita_impl(ZZ_mat<mpz_t> &B, int d, int m, double delta,
-                                         int gso_flags, double gamma_p) {
+                                         int gso_flags, double gamma_p,
+                                         long double        drop_fraction,
+                                         thermal_tie_mode_t tie_mode) {
     deep_result_t res;
     memset(&res, 0, sizeof(res));
     struct timespec t0, t1;
@@ -1175,10 +1297,13 @@ static deep_result_t run_deep_inita_impl(ZZ_mat<mpz_t> &B, int d, int m, double 
     double       alpha       = 1.0;
     long double *mu = (long double *)calloc((size_t)d * d, sizeof(long double));
     long double *r  = (long double *)calloc((size_t)d, sizeof(long double));
+    std::vector<long double> ra((size_t)d);
 
-    ZZ_mat<mpz_t>                 eu, eut;
-    MatGSO<Z_NR<mpz_t>, FT>       M(B, eu, eut, gso_flags);
-    LLLReduction<Z_NR<mpz_t>, FT> L(M, delta, LLL_DEF_ETA, LLL_DEFAULT);
+    ZZ_mat<mpz_t>                    eu, eut;
+    MatGSO<Z_NR<mpz_t>, FT>          M(B, eu, eut, gso_flags);
+    LLLReduction<Z_NR<mpz_t>, FT>    L(M, delta, LLL_DEF_ETA, LLL_DEFAULT);
+    std::vector<thermal_candidate_t> candidates;
+    if (tie_mode != THERMAL_EXACT) candidates.reserve((size_t)d * (d - 1) / 2);
 
     /* Compute alpha from the raw GSO profile.  Use the selected GSO
        precision here as well, because a double GSO can overflow on a
@@ -1196,9 +1321,13 @@ static deep_result_t run_deep_inita_impl(ZZ_mat<mpz_t> &B, int d, int m, double 
             var_logr_raw += diff * diff;
         }
         var_logr_raw /= d;
-        double cv0 = sqrt(var_logr_raw) / fmax(fabs(mean_logr_raw), 1e-10);
+        double cv0 = mean_logr_raw == 0.0
+                         ? std::numeric_limits<double>::infinity()
+                         : sqrt(var_logr_raw) / fabs(mean_logr_raw);
         alpha      = fmax(alpha_floor, pow(2.0 / (1.0 + cv0), gamma_p));
+        if (g_thermal_force_alpha > 0.0) alpha = g_thermal_force_alpha;
     }
+    res.alpha_used = alpha;
 
     int sr_from = 0;
     while (res.n_ops < max_ops) {
@@ -1206,17 +1335,40 @@ static deep_result_t run_deep_inita_impl(ZZ_mat<mpz_t> &B, int d, int m, double 
         read_gso_wide(M, d, mu, r);
 
         int         best_k = -1, best_j = -1;
-        int         fallback_k = -1;
-        long double best       = 0.0L;
+        int         fallback_k    = -1;
+        long double best          = 0.0L;
+        long double fallback_best = 0.0L;
+        long double min_drop      = drop_fraction * power_energy(r, d, alpha);
+        candidates.clear();
+        if (g_thermal_fastpow)
+            for (int i = 0; i < d; i++) ra[i] = power_term(r[i], alpha);
         for (int k = 1; k < d; k++) {
-            long double P_next = r[k];
-            long double drop   = 0.0L;
+            long double P_next         = r[k];
+            long double P_next_a       = g_thermal_fastpow ? ra[k] : 0.0L;
+            long double drop           = 0.0L;
+            long double potential_drop = 0.0L;
             for (int j = k - 1; j >= 0; j--) {
                 long double mkj = mu[k * d + j];
                 long double Pc  = P_next + mkj * mkj * r[j];
-                drop            = extend_power_drop(drop, r[j], P_next, Pc, alpha);
-                if (Pc < delta * r[j]) {
-                    if (j == k - 1 && fallback_k < 0) fallback_k = k;
+                if (g_thermal_fastpow) {
+                    long double Pc_a = power_term(Pc, alpha);
+                    drop += ra[j] + P_next_a - Pc_a - ra[j] * (P_next_a / Pc_a);
+                    P_next_a = Pc_a;
+                } else
+                    drop = extend_power_drop(drop, r[j], P_next, Pc, alpha);
+                potential_drop += 0.5L * logl(positive_norm(r[j]) / positive_norm(Pc));
+                if (j == k - 1 && Pc < delta * r[j]) {
+                    long double fallback_priority =
+                        tie_mode == THERMAL_POTENTIAL_BAND ? potential_drop : drop;
+                    if (fallback_k < 0 || (tie_mode != THERMAL_EXACT &&
+                                           fallback_priority > fallback_best)) {
+                        fallback_k    = k;
+                        fallback_best = fallback_priority;
+                    }
+                }
+                if (drop > min_drop) {
+                    if (tie_mode != THERMAL_EXACT)
+                        candidates.push_back({k, j, drop, potential_drop});
                     if (drop > best) {
                         best   = drop;
                         best_k = k;
@@ -1225,6 +1377,26 @@ static deep_result_t run_deep_inita_impl(ZZ_mat<mpz_t> &B, int d, int m, double 
                 }
                 P_next = Pc;
             }
+        }
+        if (tie_mode != THERMAL_EXACT && best_k >= 0) {
+            const long double band_floor = best - min_drop;
+            int               band_k = -1, band_j = -1;
+            int               band_depth = d + 1;
+            long double band_potential = -std::numeric_limits<long double>::infinity();
+            for (const thermal_candidate_t &candidate : candidates) {
+                int  depth  = candidate.k - candidate.j;
+                bool better = tie_mode == THERMAL_SHALLOW_BAND
+                                  ? depth < band_depth
+                                  : candidate.potential_drop > band_potential;
+                if (candidate.drop >= band_floor && better) {
+                    band_k         = candidate.k;
+                    band_j         = candidate.j;
+                    band_depth     = depth;
+                    band_potential = candidate.potential_drop;
+                }
+            }
+            best_k = band_k;
+            best_j = band_j;
         }
         if (best_k < 0) {
             if (fallback_k < 0) break;
@@ -1245,6 +1417,7 @@ static deep_result_t run_deep_inita_impl(ZZ_mat<mpz_t> &B, int d, int m, double 
     res.lll_reduced = is_lll_reduced(M, delta, LLL_DEF_ETA);
     res.delta0      = compute_delta0(B, d, m, r);
     res.final_var   = profile_variance(r, d);
+    res.kappa_f     = max_relative_power_drop(mu, r, d, alpha);
     clock_gettime(CLOCK_MONOTONIC, &t1);
     res.elapsed_sec = (t1.tv_sec - t0.tv_sec) + (t1.tv_nsec - t0.tv_nsec) * 1e-9;
     free(mu);
@@ -1253,14 +1426,40 @@ static deep_result_t run_deep_inita_impl(ZZ_mat<mpz_t> &B, int d, int m, double 
 }
 
 static deep_result_t run_deep_inita(ZZ_mat<mpz_t> &B, int d, int m, double delta,
-                                    double gamma_p) {
+                                    double gamma_p, long double drop_fraction) {
     int mb = compute_max_bits(B, d, m);
     if (mb > 26) {
         FP_NR<mpfr_t>::set_prec(2 * mb + 64);
-        return run_deep_inita_impl<FP_NR<mpfr_t>>(B, d, m, delta, GSO_INT_GRAM,
-                                                  gamma_p);
+        return run_deep_inita_impl<FP_NR<mpfr_t>>(B, d, m, delta, GSO_INT_GRAM, gamma_p,
+                                                  drop_fraction, THERMAL_EXACT);
     }
-    return run_deep_inita_impl<FP_NR<double>>(B, d, m, delta, GSO_DEFAULT, gamma_p);
+    return run_deep_inita_impl<FP_NR<double>>(B, d, m, delta, GSO_DEFAULT, gamma_p,
+                                              drop_fraction, THERMAL_EXACT);
+}
+
+static deep_result_t run_deep_band(ZZ_mat<mpz_t> &B, int d, int m, double delta,
+                                   double gamma_p, long double drop_fraction) {
+    int mb = compute_max_bits(B, d, m);
+    if (mb > 26) {
+        FP_NR<mpfr_t>::set_prec(2 * mb + 64);
+        return run_deep_inita_impl<FP_NR<mpfr_t>>(B, d, m, delta, GSO_INT_GRAM, gamma_p,
+                                                  drop_fraction, THERMAL_SHALLOW_BAND);
+    }
+    return run_deep_inita_impl<FP_NR<double>>(B, d, m, delta, GSO_DEFAULT, gamma_p,
+                                              drop_fraction, THERMAL_SHALLOW_BAND);
+}
+
+static deep_result_t run_deep_two_clock(ZZ_mat<mpz_t> &B, int d, int m, double delta,
+                                        double gamma_p, long double drop_fraction) {
+    int mb = compute_max_bits(B, d, m);
+    if (mb > 26) {
+        FP_NR<mpfr_t>::set_prec(2 * mb + 64);
+        return run_deep_inita_impl<FP_NR<mpfr_t>>(B, d, m, delta, GSO_INT_GRAM, gamma_p,
+                                                  drop_fraction,
+                                                  THERMAL_POTENTIAL_BAND);
+    }
+    return run_deep_inita_impl<FP_NR<double>>(B, d, m, delta, GSO_DEFAULT, gamma_p,
+                                              drop_fraction, THERMAL_POTENTIAL_BAND);
 }
 
 /* ================================================================== */
@@ -1454,7 +1653,9 @@ static deep_result_t run_deep_hybrid_impl(ZZ_mat<mpz_t> &B, int d, int m, double
             var_logr_raw += diff * diff;
         }
         var_logr_raw /= d;
-        double cv0 = sqrt(var_logr_raw) / fmax(fabs(mean_logr_raw), 1e-10);
+        double cv0 = mean_logr_raw == 0.0
+                         ? std::numeric_limits<double>::infinity()
+                         : sqrt(var_logr_raw) / fabs(mean_logr_raw);
         alpha      = fmax(alpha_floor, A * pow(1.0 + cv0, -gamma_p));
     }
 
@@ -2027,9 +2228,9 @@ static inline long double gdlll_roi_score(long double dV, int depth,
 }
 
 template <class FT>
-static gdlll_result_t run_gdlll_impl_scored(ZZ_mat<mpz_t> &B, int d, int m,
-                                            double delta, int gso_flags,
-                                            double fixed_cost) {
+static gdlll_result_t
+run_gdlll_impl_scored(ZZ_mat<mpz_t> &B, int d, int m, double delta, int gso_flags,
+                      double fixed_cost, long double drop_fraction) {
     gdlll_result_t gres;
     memset(&gres, 0, sizeof(gres));
     struct timespec t0, t1;
@@ -2048,9 +2249,7 @@ static gdlll_result_t run_gdlll_impl_scored(ZZ_mat<mpz_t> &B, int d, int m,
     M.update_gso();
     read_gso_wide(M, d, mu, r);
 
-    long double V0 = 0.0L;
-    for (int i = 0; i < d; i++) V0 += variance_term(r[i]);
-    gres.V0 = (double)V0;
+    gres.V0 = (double)centered_log_energy(r, d);
 
     while (gres.base.n_ops < max_ops) {
         L.size_reduction(sr_from, d);
@@ -2059,6 +2258,7 @@ static gdlll_result_t run_gdlll_impl_scored(ZZ_mat<mpz_t> &B, int d, int m,
         int         best_k = -1, best_j = -1;
         int         fallback_k = -1;
         long double best_roi   = 0.0L;
+        long double min_drop   = drop_fraction * centered_log_energy(r, d);
         for (int k = 1; k < d; k++) {
             long double P_next = r[k];
             long double dV     = 0.0L;
@@ -2066,15 +2266,15 @@ static gdlll_result_t run_gdlll_impl_scored(ZZ_mat<mpz_t> &B, int d, int m,
                 long double mkj = mu[k * d + j];
                 long double Pc  = P_next + mkj * mkj * r[j];
                 dV              = extend_variance_drop(dV, r[j], P_next, Pc);
-                if (Pc < delta * r[j]) {
-                    if (j == k - 1 && fallback_k < 0) fallback_k = k;
-                    int         depth = k - j;
-                    long double roi   = gdlll_roi_score(dV, depth, fixed_cost);
-                    if (roi > best_roi) {
-                        best_roi = roi;
-                        best_k   = k;
-                        best_j   = j;
-                    }
+                if (j == k - 1 && Pc < delta * r[j] && fallback_k < 0) {
+                    fallback_k = k;
+                }
+                int         depth = k - j;
+                long double roi   = gdlll_roi_score(dV, depth, fixed_cost);
+                if (dV > min_drop && roi > best_roi) {
+                    best_roi = roi;
+                    best_k   = k;
+                    best_j   = j;
                 }
                 P_next = Pc;
             }
@@ -2098,6 +2298,7 @@ static gdlll_result_t run_gdlll_impl_scored(ZZ_mat<mpz_t> &B, int d, int m,
     gres.base.lll_reduced = is_lll_reduced(M, delta, LLL_DEF_ETA);
     gres.base.delta0      = compute_delta0(B, d, m, r);
     gres.base.final_var   = profile_variance(r, d);
+    gres.base.kappa_f     = max_relative_variance_drop(mu, r, d);
     clock_gettime(CLOCK_MONOTONIC, &t1);
     gres.base.elapsed_sec = (t1.tv_sec - t0.tv_sec) + (t1.tv_nsec - t0.tv_nsec) * 1e-9;
 
@@ -2106,25 +2307,29 @@ static gdlll_result_t run_gdlll_impl_scored(ZZ_mat<mpz_t> &B, int d, int m,
     return gres;
 }
 
-static gdlll_result_t run_gdlll(ZZ_mat<mpz_t> &B, int d, int m, double delta) {
+static gdlll_result_t run_gdlll(ZZ_mat<mpz_t> &B, int d, int m, double delta,
+                                long double drop_fraction) {
     int mb = compute_max_bits(B, d, m);
     if (mb > 26) {
         FP_NR<mpfr_t>::set_prec(2 * mb + 64);
-        return run_gdlll_impl_scored<FP_NR<mpfr_t>>(B, d, m, delta, GSO_INT_GRAM, 0.0);
+        return run_gdlll_impl_scored<FP_NR<mpfr_t>>(B, d, m, delta, GSO_INT_GRAM, 0.0,
+                                                    drop_fraction);
     }
-    return run_gdlll_impl_scored<FP_NR<double>>(B, d, m, delta, GSO_DEFAULT, 0.0);
+    return run_gdlll_impl_scored<FP_NR<double>>(B, d, m, delta, GSO_DEFAULT, 0.0,
+                                                drop_fraction);
 }
 
 static gdlll_result_t run_gdlll_costaware(ZZ_mat<mpz_t> &B, int d, int m, double delta,
-                                          double fixed_cost) {
+                                          double      fixed_cost,
+                                          long double drop_fraction) {
     int mb = compute_max_bits(B, d, m);
     if (mb > 26) {
         FP_NR<mpfr_t>::set_prec(2 * mb + 64);
         return run_gdlll_impl_scored<FP_NR<mpfr_t>>(B, d, m, delta, GSO_INT_GRAM,
-                                                    fixed_cost);
+                                                    fixed_cost, drop_fraction);
     }
-    return run_gdlll_impl_scored<FP_NR<double>>(B, d, m, delta, GSO_DEFAULT,
-                                                fixed_cost);
+    return run_gdlll_impl_scored<FP_NR<double>>(B, d, m, delta, GSO_DEFAULT, fixed_cost,
+                                                drop_fraction);
 }
 
 template <class FT>

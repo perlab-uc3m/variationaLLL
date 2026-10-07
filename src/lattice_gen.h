@@ -38,10 +38,12 @@ static void gen_uniform(ZZ_mat<mpz_t> &B, int d, int bound) {
     while (attempts++ < 500) {
         for (int i = 0; i < d; i++)
             for (int j = 0; j < d; j++) B[i][j] = (rand() % (2 * bound + 1)) - bound;
-        /* Quick rank check via LLL — succeeds iff full rank */
+        /* Quick rank check via LLL — check that the reduced copy has no zero row */
         ZZ_mat<mpz_t> tmp = copy_basis(B);
         int s = lll_reduction(tmp, 0.99, 0.51, LM_WRAPPER, FT_DEFAULT, 0, LLL_DEFAULT);
-        if (s == RED_SUCCESS) return;
+        bool full_rank = (s == RED_SUCCESS);
+        for (int i = 0; i < d && full_rank; i++) full_rank = !tmp[i].is_zero();
+        if (full_rank) return;
     }
     fprintf(stderr, "gen_uniform: failed after 500 attempts\n");
     abort();
@@ -62,7 +64,9 @@ static void gen_gaussian(ZZ_mat<mpz_t> &B, int d, double sigma) {
             }
         ZZ_mat<mpz_t> tmp = copy_basis(B);
         int s = lll_reduction(tmp, 0.99, 0.51, LM_WRAPPER, FT_DEFAULT, 0, LLL_DEFAULT);
-        if (s == RED_SUCCESS) return;
+        bool full_rank = (s == RED_SUCCESS);
+        for (int i = 0; i < d && full_rank; i++) full_rank = !tmp[i].is_zero();
+        if (full_rank) return;
     }
     fprintf(stderr, "gen_gaussian: failed after 500 attempts\n");
     abort();

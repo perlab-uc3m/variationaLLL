@@ -8,3 +8,20 @@ __pycache__/
 .venv/
 .vscode/
 .DS_Store
+
+# Preserve the archived DCC revision evidence when preparing a release.
+!results/
+results/*
+!results/fastpow_gq.json
+!results/fixed_gauss_a2.json
+!results/fixed_gauss_a3.json
+!results/fixed_gm_a2.json
+!results/fixed_qary_a2.json
+!results/main_gm_4060.json
+!results/main_gm_80a.json
+!results/main_gm_80b.json
+!results/main_gq.json
+!results/scale4_gauss.json
+!results/summary.json
+!results/validate_theory.json
+!results/lll_depth_*.json

@@ -23,6 +23,7 @@ echo "Running 30 lattices per cell."
     --families gaussian,qary,goldstein-mayer \
     --dims 40,60,80,100,120,160 \
     --nlat 30 --main-only \
+    --score-drop 1e-6 \
     --seed "$SEED" --nthreads "$THREADS" \
     -o "$PENDING"
 
