@@ -480,7 +480,14 @@ static inline long double extend_variance_drop(long double drop, long double rj,
     return drop + 0.5L * (old_gap * old_gap - new_gap * new_gap);
 }
 
+/* Opt-in square-score specialization; keep archived benchmark defaults intact. */
+static int g_thermal_square_fast = 0;
+
 static inline long double power_term(long double r, double alpha) {
+    if (g_thermal_square_fast && alpha == 2.0) {
+        long double x = positive_norm(r);
+        return x * x;
+    }
     return powl(positive_norm(r), (long double)alpha);
 }
 
@@ -552,6 +559,15 @@ static inline long double extend_power_drop(long double drop, long double rj,
     long double shifted = rj * (P_next / positive_norm(P_cur));
     return drop + power_term(rj, alpha) + power_term(P_next, alpha) -
            power_term(P_cur, alpha) - power_term(shifted, alpha);
+}
+
+static inline long double extend_square_drop(long double drop, long double rj,
+                                             long double P_next, long double P_cur) {
+    // The two changed GSO norms preserve their product. Factor the
+    // difference of square sums using the corresponding SS drop.
+    long double shifted = rj * (P_next / positive_norm(P_cur));
+    long double ss_drop = (rj - P_cur) + (P_next - shifted);
+    return drop + ss_drop * (rj + P_next + P_cur + shifted);
 }
 
 static double max_relative_power_drop(const long double *mu, const long double *r,
@@ -1328,6 +1344,8 @@ static deep_result_t run_deep_inita_impl(ZZ_mat<mpz_t> &B, int d, int m, double 
         if (g_thermal_force_alpha > 0.0) alpha = g_thermal_force_alpha;
     }
     res.alpha_used = alpha;
+    const bool square_fast_exact =
+        g_thermal_square_fast && alpha == 2.0 && tie_mode == THERMAL_EXACT;
 
     int sr_from = 0;
     while (res.n_ops < max_ops) {
@@ -1354,9 +1372,13 @@ static deep_result_t run_deep_inita_impl(ZZ_mat<mpz_t> &B, int d, int m, double 
                     long double Pc_a = power_term(Pc, alpha);
                     drop += ra[j] + P_next_a - Pc_a - ra[j] * (P_next_a / Pc_a);
                     P_next_a = Pc_a;
-                } else
+                } else if (square_fast_exact)
+                    drop = extend_square_drop(drop, r[j], P_next, Pc);
+                else
                     drop = extend_power_drop(drop, r[j], P_next, Pc, alpha);
-                potential_drop += 0.5L * logl(positive_norm(r[j]) / positive_norm(Pc));
+                if (!square_fast_exact)
+                    potential_drop +=
+                        0.5L * logl(positive_norm(r[j]) / positive_norm(Pc));
                 if (j == k - 1 && Pc < delta * r[j]) {
                     long double fallback_priority =
                         tie_mode == THERMAL_POTENTIAL_BAND ? potential_drop : drop;

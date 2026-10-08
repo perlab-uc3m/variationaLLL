@@ -25,3 +25,6 @@ results/*
 !results/summary.json
 !results/validate_theory.json
 !results/lll_depth_*.json
+
+# Focused opt-in square-score timing check.
+!results/alpha2_square_gauss80_r*.json

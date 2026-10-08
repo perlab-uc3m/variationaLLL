@@ -291,6 +291,7 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "--algs") && i + 1 < argc)
             n_alg_sel = parse_ints(argv[++i], alg_sel, N_ALG);
         else if (!strcmp(argv[i], "--thermal-fastpow")) g_thermal_fastpow = 1;
+        else if (!strcmp(argv[i], "--thermal-square-fast")) g_thermal_square_fast = 1;
         else if (!strcmp(argv[i], "--scale") && i + 1 < argc) basis_scale = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--fixed-alpha") && i + 1 < argc)
             g_thermal_force_alpha = atof(argv[++i]);
@@ -313,6 +314,7 @@ int main(int argc, char **argv) {
                 "  --target-b B        residual shortlist size for G-DLLL-RT (0=auto)\n"
 
                 "  --families f1,...   families (default: gaussian,qary)\n"
+                "  --thermal-square-fast  specialize alpha=2 scoring (opt-in)\n"
                 "  --nthreads T        OpenMP threads (0=auto)\n"
                 "  --main-only         run LLL and the four main selectors only\n"
                 "  --compare-thermal-band  run Thermal-Adaptive and Thermal-Band\n"
@@ -375,6 +377,7 @@ int main(int argc, char **argv) {
     jd(out, "forced_alpha", g_thermal_force_alpha);
     ji(out, "basis_scale", basis_scale);
     ji(out, "thermal_fastpow", g_thermal_fastpow);
+    ji(out, "thermal_square_fast", g_thermal_square_fast);
     ji(out, "target_b", g_targetb);
     ji(out, "threads", actual_threads);
     ji(out, "main_only", main_only ? 1 : 0);

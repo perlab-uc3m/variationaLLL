@@ -115,7 +115,28 @@ exact rational GSO and numerical logarithms, and writes `validate_theory.json`.
 
 New driver options: `--algs i,j,...` (algorithm indices), `--thermal-only`,
 `--fixed-alpha A` (thermal score with a fixed exponent), `--scale s` (multiply
-every basis by `s`), and `--thermal-fastpow` (precomputed powers; algebraically equivalent score evaluation, faster). The seed of every basis now depends only on
+every basis by `s`), and `--thermal-fastpow` (precomputed powers; algebraically
+equivalent score evaluation). The seed of every basis now depends only on
 (seed, family, d, index), and fplll's GMP generator is reseeded per basis, so
 separate runs see identical bases. JSON output stores per-sample arrays
 (`s_ops`, `s_equiv_swaps`, `s_time`, `s_delta0`, `s_alpha`, ...).
+
+### Optional square-score specialization
+
+`--fixed-alpha 2 --thermal-square-fast` scores the thermal objective
+`sum(r_i^2)` with arithmetic operations instead of general powers. The flag is
+opt-in so the archived paper benchmarks still use their original scoring path.
+It preserves the selection rule in exact arithmetic; floating-point ties can
+still affect a trajectory. For a paired SS-GG comparison on the same bases:
+
+```bash
+src/build/gdlll_benchmark --dims 80 --nlat 30 --nthreads 1 \
+  --families gaussian --algs 2,3 --fixed-alpha 2 \
+  --thermal-square-fast --seed 42 --score-drop 1e-6 -o /tmp/alpha2.json
+```
+
+The three `results/alpha2_square_gauss80_r*.json` files are repeated runs of
+this command with fplll 5.4.5. Their per-basis move counts and recorded output
+metrics match the archived fixed-alpha-2 data. On this local machine the paired
+square-score/SS-GG time ratios were 0.87, 0.92, and 0.86. This is a focused
+Gaussian timing check, not a claim of improvement for every input family.
