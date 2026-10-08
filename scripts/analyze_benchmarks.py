@@ -1,23 +1,23 @@
 #!/usr/bin/env python3
-"""Build the tables, figure, and summary numbers of Section 6 from the raw
-per-sample benchmark output of gdlll_benchmark (variationaLLL).
+"""Build Section 6 tables, figure, and summary from per-sample benchmark output.
 
 Usage: python3 analyze_benchmarks.py RESULTS_DIR PAPER_DIR
-Writes PAPER_DIR/figures/fig_benchmarks.pdf, PAPER_DIR/tables/tab_*.tex and
-RESULTS_DIR/summary.json.
+Updates the marked inline tables in PAPER_DIR/main_review.tex when present,
+writes PAPER_DIR/figures/review/fig_benchmarks.pdf and RESULTS_DIR/summary.json.
+For a separate output directory, prints the table rows to stdout.
 """
 import glob
 import json
 import math
 import os
+import re
 import sys
 
 import numpy as np
 from scipy import stats
 
 RES, PAPER = sys.argv[1], sys.argv[2]
-os.makedirs(os.path.join(PAPER, "figures"), exist_ok=True)
-os.makedirs(os.path.join(PAPER, "tables"), exist_ok=True)
+os.makedirs(os.path.join(PAPER, "figures", "review"), exist_ok=True)
 
 ALGS = ["LLL", "Deep-Var", "SS-GG", "Thermal-Adaptive", "G-DLLL"]
 FAMS = ["gaussian", "qary", "goldstein-mayer"]
@@ -190,8 +190,7 @@ for metric, key in (("Insertion count $N$", "s_ops"),
         rows.append(r"\addlinespace")
     rows.append(r"\midrule")
 rows = rows[1:-2]
-with open(os.path.join(PAPER, "tables", "tab_counts.tex"), "w") as fh:
-    fh.write("\n".join(rows) + "\n")
+inline_tables = {"COUNTS": "\n".join(rows) + "\n"}
 
 # ------------------------------------------------------- paired comparisons
 prow = []
@@ -255,10 +254,49 @@ for fam in scaled:
             summary["paired"].setdefault("TA_scaled4_vs_TA", {}).setdefault(fam, {})[d] = rec2
 if prow and prow[-1] == r"\addlinespace":
     prow.pop()
-with open(os.path.join(PAPER, "tables", "tab_paired.tex"), "w") as fh:
-    fh.write("\n".join(prow) + "\n")
-with open(os.path.join(PAPER, "tables", "tab_fixed.tex"), "w") as fh:
-    fh.write("\n".join(frow) + "\n")
+inline_tables["PAIRED"] = "\n".join(prow) + "\n"
+inline_tables["FIXED"] = "\n".join(frow) + "\n"
+source = os.path.join(PAPER, "main_review.tex")
+if os.path.isfile(source):
+    manuscript = open(source).read()
+    revised = manuscript
+
+    def without_blue_markup(value):
+        """Compare generated rows with their marked copy without removing marks."""
+        prefix = r"\textcolor{blue}{"
+        out, i = [], 0
+        while i < len(value):
+            if value.startswith(prefix, i):
+                start = i + len(prefix)
+                depth, j = 1, start
+                while depth:
+                    if j >= len(value):
+                        raise ValueError("unbalanced blue markup in generated table")
+                    if value[j] == "{" and (j == 0 or value[j - 1] != "\\"):
+                        depth += 1
+                    elif value[j] == "}" and (j == 0 or value[j - 1] != "\\"):
+                        depth -= 1
+                    j += 1
+                out.append(without_blue_markup(value[start:j - 1]))
+                i = j
+            else:
+                out.append(value[i])
+                i += 1
+        return "".join(out)
+
+    for name, table_rows in inline_tables.items():
+        pattern = re.compile(r"(?<=% BEGIN GENERATED " + name + r"\n).*?(?=% END GENERATED " + name + r")", re.S)
+        def update_rows(match):
+            return match.group() if without_blue_markup(match.group()) == table_rows else table_rows
+        revised, count = pattern.subn(update_rows, revised)
+        if count != 1:
+            raise ValueError(f"expected one inline {name} table in {source}; found {count}")
+    if revised != manuscript:
+        with open(source, "w") as fh:
+            fh.write(revised)
+else:
+    for name, table_rows in inline_tables.items():
+        print(f"INLINE TABLE {name}\n{table_rows}")
 
 # Deep-Var and G-DLLL vs SS-GG (for prose)
 for other in ["Deep-Var", "G-DLLL", "LLL"]:
@@ -326,5 +364,5 @@ for j in range(3):
 h, l = axes[0][0].get_legend_handles_labels()
 fig.legend(h, l, loc="upper center", ncol=5, frameon=False, bbox_to_anchor=(0.5, 1.0))
 fig.tight_layout(rect=(0, 0, 1, 0.97))
-fig.savefig(os.path.join(PAPER, "figures", "fig_benchmarks.pdf"))
-print("wrote figure and tables")
+fig.savefig(os.path.join(PAPER, "figures", "review", "fig_benchmarks.pdf"))
+print("verified inline tables and wrote review figure")

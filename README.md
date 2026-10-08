@@ -67,10 +67,12 @@ python3 scripts/analyze_benchmarks.py results ../paper
 ```
 
 The revision runner uses a fresh timestamped results directory (override with
-`RESULTS_DIR`) and writes generated tables and a figure to `paper_out/`.
-The second command above regenerates the manuscript from the archived revision
-files in `results/`; use the fresh directory to analyze a new run. The analysis
-rejects incomplete, failed, duplicate, or nonfinite data before producing tables.
+`RESULTS_DIR`) and writes the review figure to `paper_out/figures/review/`;
+its table rows are printed to stdout. The second command above checks or updates
+the tables inline in `paper/main_review.tex` from the archived results and writes
+the review figure to `paper/figures/review/`. Use a fresh results directory to
+analyze a new run. The analysis rejects incomplete, failed, duplicate, or
+nonfinite data before producing tables.
 It requires NumPy, SciPy and Matplotlib. The theory checks require NumPy and use
 Python's `Fraction` for exact GSO and `Decimal` for the new logarithmic checks.
 
@@ -97,7 +99,7 @@ src/build/gdlll_benchmark --dims 20 --nlat 3 --main-only --families gaussian,qar
 src/        C++ canonical implementation (gdlll_benchmark)
 scripts/    Python: lattice generators, plot/table builders, run drivers
 results/    JSON benchmark output (created on first run)
-figures/    Plots and LaTeX table snippets (created on first run)
+figures/    Plots (created on first run)
 ```
 
 ## License
@@ -108,8 +110,9 @@ MIT.
 
 `scripts/run_revision_benchmarks.sh` reproduces every number of Section 6 of the
 revised manuscript and writes raw per-sample JSON to `results/`;
-`scripts/analyze_benchmarks.py results <outdir>` builds the tables, the figure,
-and `results/summary.json` (paired ratios with 95% intervals).
+`scripts/analyze_benchmarks.py results ../paper` refreshes the inline tables in
+`paper/main_review.tex`, writes `paper/figures/review/fig_benchmarks.pdf`, and
+updates `results/summary.json` (paired ratios with 95% intervals).
 `scripts/validate_theory.py` checks the theoretical statements of the paper in
 exact rational GSO and numerical logarithms, and writes `validate_theory.json`.
 

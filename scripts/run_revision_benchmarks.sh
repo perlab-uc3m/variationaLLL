@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Reproduce every benchmark of Section 6 of the revised manuscript.
-# Writes raw per-sample JSON to results/ and then builds tables and figure.
+# Writes raw per-sample JSON, prints table rows, and builds the review figure.
 # Runtime: about 4 h on 2 cores (Goldstein-Mayer d=80 dominates).
 set -euo pipefail
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
