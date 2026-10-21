@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""Build Section 6 tables, figure, and summary from per-sample benchmark output.
+"""Build Section 6 tables, figures, and summary from per-sample benchmark output.
 
 Usage: python3 analyze_benchmarks.py RESULTS_DIR PAPER_DIR
 Updates the marked inline tables in PAPER_DIR/main_review.tex when present,
-writes PAPER_DIR/figures/review/fig_benchmarks.pdf and RESULTS_DIR/summary.json.
+writes PAPER_DIR/figures/review/deep_benchmark_*.pdf and RESULTS_DIR/summary.json.
 For a separate output directory, prints the table rows to stdout.
 """
 import glob
@@ -327,42 +327,65 @@ if os.path.exists(fp):
 
 json.dump(summary, open(os.path.join(RES, "summary.json"), "w"), indent=1)
 
-# -------------------------------------------------------------------- figure
+# ------------------------------------------------------------------- figures
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+import matplotlib.colors as mcolors
 
-plt.rcParams.update({"font.family": "serif", "font.size": 8, "axes.labelsize": 8,
-                     "legend.fontsize": 7, "xtick.labelsize": 7, "ytick.labelsize": 7,
-                     "mathtext.fontset": "cm"})
-COL = {"LLL": "#555555", "Deep-Var": "#1f77b4", "SS-GG": "#d62728",
-       "Thermal-Adaptive": "#2ca02c", "G-DLLL": "#9467bd"}
-MK = {"LLL": "s", "Deep-Var": "o", "SS-GG": "^", "Thermal-Adaptive": "D", "G-DLLL": "v"}
-fams = [f for f in FAMS if f in main]
-fig, axes = plt.subplots(len(fams), 3, figsize=(6.6, 1.95 * len(fams)), squeeze=False)
-for i, fam in enumerate(fams):
-    dims = sorted(d for d in main[fam] if all(a in main[fam][d] for a in ALGS))
-    for a in ALGS:
-        for j, (key, logy) in enumerate([("s_ops", True), ("s_time", True), ("s_delta0", False)]):
-            ax = axes[i][j]
-            m = [arr(main[fam][d][a], key).mean() for d in dims]
-            se = [arr(main[fam][d][a], key).std(ddof=1) / math.sqrt(len(main[fam][d][a][key]))
-                  for d in dims]
-            off = (ALGS.index(a) - 2) * 0.6 if key == "s_delta0" else 0
-            ax.errorbar(np.array(dims) + off, m, yerr=se, color=COL[a], marker=MK[a], ms=3,
-                        lw=1, capsize=1.5, label=a if a != "LLL" else "LLL (fplll)")
-            if logy:
-                ax.set_yscale("log")
-    axes[i][0].set_ylabel({"gaussian": "Gaussian", "qary": "$q$-ary", "goldstein-mayer": "Goldstein-Mayer"}[fam] + "\n" + "insertion count $N$")
-    axes[i][1].set_ylabel("time [s]")
-    axes[i][2].set_ylabel(r"root-Hermite factor $\delta_0$")
-    for j in range(3):
-        axes[i][j].set_xticks(dims)
-        axes[i][j].grid(alpha=0.25, lw=0.5)
-for j in range(3):
-    axes[-1][j].set_xlabel("dimension $d$")
-h, l = axes[0][0].get_legend_handles_labels()
-fig.legend(h, l, loc="upper center", ncol=5, frameon=False, bbox_to_anchor=(0.5, 1.0))
-fig.tight_layout(rect=(0, 0, 1, 0.97))
-fig.savefig(os.path.join(PAPER, "figures", "review", "fig_benchmarks.pdf"))
-print("verified inline tables and wrote review figure")
+# Preserve the manuscript style from generate_gdlll_plots.py.
+plt.rcParams.update({
+    "font.family": "Ubuntu", "pdf.fonttype": 42, "ps.fonttype": 42,
+    "font.size": 9, "axes.titlesize": 10, "axes.titleweight": "bold",
+    "axes.labelsize": 9, "axes.labelweight": "bold", "legend.fontsize": 7,
+    "xtick.labelsize": 8, "ytick.labelsize": 8, "savefig.dpi": 300,
+})
+cmap = mcolors.LinearSegmentedColormap.from_list("", ["#9fcf69", "#33acdc"])
+palette = [cmap(x) for x in np.linspace(0, 1, 8)]
+colors = {"LLL": "#7f7f7f", "Deep-Var": palette[0], "SS-GG": "#d67474",
+          "Thermal-Adaptive": palette[7], "G-DLLL": palette[4]}
+markers = {"LLL": "v", "Deep-Var": "o", "SS-GG": "s",
+           "Thermal-Adaptive": "^", "G-DLLL": "D"}
+metrics = [
+    ("s_ops", "(a) Insertion count", "$N$", True),
+    ("s_equiv_swaps", "(b) Equivalent-swap count", "$W$", True),
+    ("s_time", "(c) Wall-clock time", "Time (s)", True),
+    ("s_delta0", "(d) Root-Hermite factor", r"$\delta_0$", False),
+]
+tags = {"gaussian": "gaussian", "qary": "qary", "goldstein-mayer": "goldstein"}
+for fam in FAMS:
+    dims = sorted(main[fam])
+    fig, axes = plt.subplots(2, 2, figsize=(6.6, 4.65))
+    for ax, (key, title, ylabel, logy) in zip(axes.flat, metrics):
+        for a in ALGS:
+            means, errors = zip(*(mean_se(arr(main[fam][d][a], key)) for d in dims))
+            means, errors = np.asarray(means), np.asarray(errors)
+            x = np.asarray(dims, float)
+            label = a if a != "LLL" else "LLL (fplll)"
+            if key == "s_delta0":
+                x += (ALGS.index(a) - 2) * 0.3
+                ax.errorbar(x, means, yerr=errors, color=colors[a], marker=markers[a],
+                            ms=4, lw=1.5, capsize=2, label=label)
+            else:
+                ax.plot(x, means, color=colors[a], marker=markers[a], ms=4,
+                        lw=1.5, label=label)
+                ax.fill_between(x, np.maximum(means - errors, np.finfo(float).tiny),
+                                means + errors, color=colors[a], alpha=0.15)
+        if logy:
+            ax.set_yscale("log")
+        else:
+            ax.ticklabel_format(axis="y", style="plain", useOffset=False)
+        ax.set_title(title)
+        ax.set_ylabel(ylabel)
+        ax.set_xlabel(r"Dimension $d$")
+        ax.set_xticks(dims)
+        ax.grid(True, linestyle="--", which="both", color="grey", alpha=0.4)
+        ax.set_axisbelow(True)
+    handles, labels = axes[0, 0].get_legend_handles_labels()
+    fig.legend(handles, labels, loc="upper center", ncol=5, frameon=False,
+               bbox_to_anchor=(0.5, 1.0))
+    fig.tight_layout(rect=(0, 0, 1, 0.94), h_pad=1.2, w_pad=2)
+    fig.savefig(os.path.join(PAPER, "figures", "review",
+                             f"deep_benchmark_{tags[fam]}.pdf"), bbox_inches="tight")
+    plt.close(fig)
+print("verified inline tables and wrote three review figures")

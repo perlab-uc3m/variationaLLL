@@ -67,10 +67,10 @@ python3 scripts/analyze_benchmarks.py results ../paper
 ```
 
 The revision runner uses a fresh timestamped results directory (override with
-`RESULTS_DIR`) and writes the review figure to `paper_out/figures/review/`;
+`RESULTS_DIR`) and writes the three review figures to `paper_out/figures/review/`;
 its table rows are printed to stdout. The second command above checks or updates
 the tables inline in `paper/main_review.tex` from the archived results and writes
-the review figure to `paper/figures/review/`. Use a fresh results directory to
+the review figures to `paper/figures/review/`. Use a fresh results directory to
 analyze a new run. The analysis rejects incomplete, failed, duplicate, or
 nonfinite data before producing tables.
 It requires NumPy, SciPy and Matplotlib. The theory checks require NumPy and use
@@ -111,7 +111,8 @@ MIT.
 `scripts/run_revision_benchmarks.sh` reproduces every number of Section 6 of the
 revised manuscript and writes raw per-sample JSON to `results/`;
 `scripts/analyze_benchmarks.py results ../paper` refreshes the inline tables in
-`paper/main_review.tex`, writes `paper/figures/review/fig_benchmarks.pdf`, and
+`paper/main_review.tex`, writes the three family comparisons to
+`paper/figures/review/deep_benchmark_*.pdf`, and
 updates `results/summary.json` (paired ratios with 95% intervals).
 `scripts/validate_theory.py` checks the theoretical statements of the paper in
 exact rational GSO and numerical logarithms, and writes `validate_theory.json`.
